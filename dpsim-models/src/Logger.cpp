@@ -86,7 +86,7 @@ String Logger::logDir() {
 
 /// Set env variable CPS_LOG_DIR and overwrite
 void Logger::setLogDir(String path) {
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
   setenv("CPS_LOG_DIR", path.c_str(), 1);
 #elif defined(_WIN32)
   String var = "CPS_LOG_DIR=" + path;
