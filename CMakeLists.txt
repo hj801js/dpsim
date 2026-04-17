@@ -158,7 +158,21 @@ endif()
 if(FETCH_EIGEN OR WIN32)
 	include(FetchEigen)
 else()
-	find_package(Eigen3 3.0 REQUIRED)
+	# DPsim's Eigen API surface (Matrix, SparseMatrix, Map, Block, LU, lpNorm,
+	# triangularView, cast, ...) is stable across Eigen 3.4 through 5.x, so
+	# accept either major version. CMake's `min...max` find_package range
+	# syntax requires >= 3.19; fall back to a manual version check below it
+	# so DPsim still builds on CMake 3.14 (minimum supported, e.g. OPAL-RT).
+	if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.19)
+		find_package(Eigen3 3.4...5.99 REQUIRED)
+	else()
+		find_package(Eigen3 REQUIRED)
+		if(DEFINED Eigen3_VERSION AND Eigen3_VERSION VERSION_LESS 3.4)
+			message(FATAL_ERROR
+				"DPsim requires Eigen >= 3.4 (found ${Eigen3_VERSION}). "
+				"Set -DFETCH_EIGEN=ON to download a compatible Eigen at build time.")
+		endif()
+	endif()
 endif()
 
 if(FETCH_SUITESPARSE)
