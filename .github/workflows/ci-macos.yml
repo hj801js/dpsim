@@ -1,0 +1,80 @@
+# macOS arm64 build + smoke for the hj801js fork.
+#
+# Exercises:
+#   - dpsim build on macos-14 (arm64) with our portability fixes
+#   - dpsimpy import (with CIMpp)
+#   - end-to-end service stack smoke test against brew-installed redis+rabbitmq
+
+name: macOS build + smoke
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Homebrew deps
+        run: |
+          brew install cmake pybind11 eigen spdlog fmt nlohmann-json \
+                       graphviz redis rabbitmq rust
+
+      - name: Start brew services
+        run: |
+          brew services start redis
+          brew services start rabbitmq
+          sleep 10  # allow rabbitmq epmd to warm up
+
+      - name: Configure DPsim
+        run: |
+          mkdir -p build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWITH_VILLAS=OFF -DWITH_RT=OFF -DWITH_GSL=OFF \
+            -DWITH_GRAPHVIZ=OFF -DWITH_SUNDIALS=OFF -DWITH_OPENMP=OFF \
+            -DDPSIM_BUILD_EXAMPLES=OFF -DDPSIM_BUILD_DOC=OFF \
+            -DFETCH_SUITESPARSE=ON -DFETCH_PYBIND=OFF -DFETCH_CIMPP=ON
+
+      - name: Build dpsimpy
+        run: cmake --build build --target dpsimpy -j$(sysctl -n hw.ncpu)
+
+      - name: Python stack deps
+        run: pip install pika redis requests flask numpy
+
+      - name: Import smoke
+        run: |
+          export PYTHONPATH="${GITHUB_WORKSPACE}/build:${GITHUB_WORKSPACE}/python/src"
+          python3 -c "import dpsimpy; print('dpsimpy OK:', sorted([n for n in dir(dpsimpy) if 'CIM' in n]))"
+
+      # -----------------------------------------------------------------
+      # End-to-end stack smoke — dpsim-api is maintained in a separate
+      # repo. Uncomment & adapt once the companion fork is wired into CI.
+      # -----------------------------------------------------------------
+      # - name: Checkout dpsim-api
+      #   uses: actions/checkout@v4
+      #   with:
+      #     repository: hj801js/dpsim-api
+      #     ref: fix/configurable-service-urls
+      #     path: dpsim-api
+      #
+      # - name: Build dpsim-api
+      #   run: cargo build --release --manifest-path dpsim-api/Cargo.toml
+      #
+      # - name: Run stack + smoke
+      #   env:
+      #     AMQP_ADDR: amqp://guest:guest@localhost:5672/%2f
+      #     REDIS_URL: redis://localhost:6379/
+      #     FILE_SERVICE_URL: http://127.0.0.1:18080
+      #     PYTHONPATH: ${GITHUB_WORKSPACE}/build:${GITHUB_WORKSPACE}/python/src
+      #   run: |
+      #     python3 examples/service-stack/file_service_stub.py &
+      #     python3 examples/service-stack/worker.py &
+      #     dpsim-api/target/release/dpsim-api &
+      #     sleep 5
+      #     bash examples/service-stack/smoke.sh
