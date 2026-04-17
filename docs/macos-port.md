@@ -2,10 +2,10 @@
 
 This fork adds the minimum patches needed for DPsim to build and run on
 macOS (Apple Clang 21 on arm64) inside a conda-forge Python 3.11
-environment, plus a local service-stack demo matching the upstream
-sogno-platform topology.
+environment, plus a local service-stack demo (REST + queue + worker
++ file-service).
 
-Upstream tracking: <https://github.com/sogno-platform/dpsim>
+Source project: <https://github.com/sogno-platform/dpsim>
 
 ## TL;DR
 
@@ -31,8 +31,7 @@ Full service stack demo + end-to-end smoke:
 
 ## Fix branches in this fork (9)
 
-Each of the following is on its own branch and is a candidate for an
-individual upstream PR.
+Each of the following is on its own branch.
 
 | Branch | Problem | Fix |
 |---|---|---|
@@ -44,7 +43,7 @@ individual upstream PR.
 | `fix/notebook-syngen-dq-api` | SynGenDQ notebook calls the mixed PF/DP wrapper API that dpsimpy no longer exposes. | Split into explicit PF and DP setup + reconcile object naming (2 commits). |
 | `fix/eigen-internal-header-removal` | `DecouplingLineEMT_Ph3.cpp` includes `<Eigen/src/Core/Array.h>` — an internal Eigen path. Breaks when Eigen rearranges. | Remove include; the public header is already transitively present. |
 | `fix/init-with-powerflow-name-check` | `initWithPowerflow` segfaults silently when the supplied PF system lacks a component with the expected name. | Raise `RuntimeError` with the missing name. |
-| `feat/service-stack-examples` | No runnable reference for the sogno-platform (REST + queue + worker) pipeline on a developer laptop. | Add `examples/service-stack/` with worker, file-service stub, compose file, smoke script, and macOS CI template. |
+| `feat/service-stack-examples` | No runnable reference for the REST + queue + worker pipeline on a developer laptop. | Add `examples/service-stack/` with worker, file-service stub, compose file, smoke script, and macOS CI template. |
 
 ## Known-tricky subtleties
 

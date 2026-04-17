@@ -1,7 +1,7 @@
 # hj801js/dpsim — Changelog
 
-Delta from upstream `sogno-platform/dpsim@master` (as of 2026-04-17).
-All items below are on their own branch for individual upstream review.
+Delta from `sogno-platform/dpsim@master` (as of 2026-04-17).
+All items below are on their own branch.
 
 ## Build & portability (macOS arm64)
 
@@ -59,13 +59,13 @@ All items below are on their own branch for individual upstream review.
 ## Local service-stack demo
 
 - **`examples/service-stack/`** (new).
-  Reference implementation of the sogno-platform topology that runs
-  on a developer laptop with nothing but brew + cargo:
+  Reference implementation of the REST + queue + worker topology
+  that runs on a developer laptop with nothing but brew + cargo:
   - `worker.py` — pika consumer, rebuilds CIM SystemTopology per
     job (see `docs/macos-port.md` on why caching is unsafe),
     structured JSON logging, DLQ parking, SIGTERM graceful shutdown.
   - `file_service_stub.py` — in-memory HTTP file service that
-    matches sogno's API surface.
+    matches the companion `hj801js/dpsim-api` API surface.
   - `docker-compose.yaml` — alternative all-in-one startup.
   - `smoke.sh` — 8-step end-to-end assertion harness, including a
     same-job×2 regression that catches SystemTopology-cache reuse
