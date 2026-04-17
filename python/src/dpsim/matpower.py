@@ -181,20 +181,20 @@ class Reader:
                 ]
 
                 gen_baseS = (
-                    gen["mBase"] * mw_w
+                    gen["mBase"].iloc[0] * mw_w
                 )  # Generator base MVA default is mpc.baseMVA
                 gen_baseV = (
                     self.mpc_bus_data.at[index, "baseKV"] * kv_v
                 )  # Generator base kV
                 gen_v = (
-                    gen["Vg"] * gen_baseV
+                    gen["Vg"].iloc[0] * gen_baseV
                 )  # Generator set point voltage (gen['Vg'] in p.u.)
                 gen_p = (
-                    gen["Pg"] * mw_w
+                    gen["Pg"].iloc[0] * mw_w
                 )  # Generator ini. active power (gen['Pg'] in MVA)
                 # gen_q = gen['Qg']*mw_w   # Generator ini. reactive power (gen['Qg'] in MVAr)
                 gen_nom_s = abs(
-                    complex(gen["Pmax"], gen["Qmax"])
+                    complex(gen["Pmax"].iloc[0], gen["Qmax"].iloc[0])
                 )  # Generator nominal power (set default to mpc.baseMVA ?)
 
                 dpsimpy_comp_dict[gen_name] = [
@@ -222,7 +222,7 @@ class Reader:
 
                 # extnet_baseS = extnet['mBase']*mw_w # Default is mpc.baseMVA
                 extnet_baseV = self.mpc_bus_data.at[index, "baseKV"] * kv_v
-                extnet_v = extnet["Vg"] * extnet_baseV
+                extnet_v = extnet["Vg"].iloc[0] * extnet_baseV
 
                 dpsimpy_comp_dict[extnet_name] = [
                     dpsimpy.sp.ph1.NetworkInjection(extnet_name, dpsimpy.LogLevel.info)
