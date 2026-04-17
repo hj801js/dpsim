@@ -8,12 +8,22 @@
 
 #pragma once
 
-#ifndef USE_GHC_FS
+#ifdef USE_GHC_FS
+#include <ghc/filesystem.hpp>
+namespace fs = ghc::filesystem;
+#elif defined(__has_include)
+#if __has_include(<filesystem>)
+#include <filesystem>
+namespace fs = std::filesystem;
+#elif __has_include(<experimental/filesystem>)
 #include <experimental/filesystem>
 namespace fs = std::experimental::filesystem;
 #else
-#include <ghc/filesystem.hpp>
-namespace fs = ghc::filesystem;
+#error "No <filesystem> or <experimental/filesystem> header found"
+#endif
+#else
+#include <experimental/filesystem>
+namespace fs = std::experimental::filesystem;
 #endif
 
 #include <spdlog/fmt/ostr.h>
