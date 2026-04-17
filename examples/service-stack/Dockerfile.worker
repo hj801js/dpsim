@@ -1,0 +1,18 @@
+# Runtime image for the DPsim AMQP worker.
+# The compiled dpsimpy is mounted in at /opt/dpsim/dpsimpy.so by the
+# compose file rather than rebuilt here, so this image stays tiny.
+
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir pika redis requests
+
+WORKDIR /opt/dpsim
+ENV PYTHONPATH=/opt/dpsim
+
+COPY worker.py /opt/dpsim/worker.py
+
+# The dpsimpy .so must be bind-mounted to /opt/dpsim/dpsimpy.so at runtime.
+# For Python to import it via `import dpsimpy` the file must be named so
+# the extension suffix matches the base interpreter. Simplest workaround
+# for a dev stack: create a symlink on container start.
+CMD ["bash", "-lc", "ln -sf /opt/dpsim/dpsimpy.so /opt/dpsim/dpsimpy.cpython-311-x86_64-linux-gnu.so 2>/dev/null || true; python3 worker.py"]
