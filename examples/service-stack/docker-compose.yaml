@@ -1,0 +1,65 @@
+# Reference deployment for the DPsim service stack.
+#
+# Brings up:
+#   - redis              : simulation id + status store
+#   - rabbitmq           : dpsim-api → worker job queue
+#   - file-service-stub  : POST /api/files, GET /raw/<id>
+#   - dpsim-api          : the Rust REST layer (built from the hj801js fork)
+#   - dpsim-worker       : Python worker in this repo consuming AMQP
+#
+# Prereq: a built `dpsimpy.cpython-*.so` on the host (via the parent DPsim
+# build) — the worker container volume-mounts it in rather than compiling
+# DPsim inside this compose stack. Adjust paths for your checkout.
+#
+# Usage:
+#   docker compose up -d --build
+#   bash smoke.sh
+#   docker compose down
+
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${AMQP_USER:-dpsim}
+      RABBITMQ_DEFAULT_PASS: ${AMQP_PASS:-dpsim}
+    ports: ["5672:5672", "15672:15672"]
+
+  file-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.file-service
+    ports: ["18080:18080"]
+    environment:
+      FILE_SERVICE_HOST: "0.0.0.0"
+
+  dpsim-api:
+    # Assumes you have cloned and built hj801js/dpsim-api locally;
+    # replace `build.context` with that path or publish an image.
+    build: ../../../dpsim-api
+    depends_on: [redis, rabbitmq, file-service]
+    ports: ["8000:8000"]
+    environment:
+      REDIS_URL: "redis://redis:6379/"
+      AMQP_ADDR: "amqp://${AMQP_USER:-dpsim}:${AMQP_PASS:-dpsim}@rabbitmq:5672/%2f"
+      FILE_SERVICE_URL: "http://file-service:18080"
+
+  dpsim-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on: [redis, rabbitmq, file-service]
+    environment:
+      AMQP_HOST: rabbitmq
+      AMQP_USER: ${AMQP_USER:-dpsim}
+      AMQP_PASS: ${AMQP_PASS:-dpsim}
+      REDIS_URL: "redis://redis:6379/"
+      FILE_SERVICE_URL: "http://file-service:18080"
+    volumes:
+      # Inject the host's pre-built dpsimpy so we don't recompile in the container.
+      - ../../build/dpsimpy.cpython-311-darwin.so:/opt/dpsim/dpsimpy.so:ro

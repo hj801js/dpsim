@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir flask
+
+WORKDIR /opt/fss
+COPY file_service_stub.py /opt/fss/file_service_stub.py
+
+ENV FILE_SERVICE_HOST=0.0.0.0
+ENV FILE_SERVICE_PORT=18080
+
+EXPOSE 18080
+CMD ["python3", "file_service_stub.py"]
