@@ -22,6 +22,12 @@ app = Flask(__name__)
 STORE: dict[str, bytes] = {}
 
 HOST = os.environ.get("FILE_SERVICE_HOST", "127.0.0.1")
+# FILE_SERVICE_BIND controls the bind address (Flask app.run host); HOST
+# controls the hostname embedded in the raw-URL the stub returns. They're
+# usually the same for local dev (both 127.0.0.1), but in docker-compose
+# we bind on 0.0.0.0 while returning hostname "file-service" so sibling
+# containers can fetch /raw/<fid>.
+BIND = os.environ.get("FILE_SERVICE_BIND", HOST)
 PORT = int(os.environ.get("FILE_SERVICE_PORT", 18080))
 
 
@@ -66,4 +72,4 @@ def debug_list():
 
 
 if __name__ == "__main__":
-    app.run(host=HOST, port=PORT, threaded=True)
+    app.run(host=BIND, port=PORT, threaded=True)

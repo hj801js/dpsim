@@ -1,0 +1,55 @@
+name: ci-fork-wheels
+
+# Build dpsim wheels on every push to the fork's working branches. Mirrors the
+# upstream publish_to_pypi.yaml's matrix but:
+#   - triggers on feat/* and verify/* (master has different cadence)
+#   - uploads artifacts only, no publish (fork doesn't own sogno/dpsim on PyPI)
+#   - adds manylinux_aarch64 so Apple Silicon users get a prebuilt wheel too
+
+on:
+  push:
+    branches:
+      - "feat/**"
+      - "verify/**"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-wheels:
+    name: cibuildwheel ${{ matrix.python }}-${{ matrix.platform }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Upstream-supported: x86_64 Linux via sogno/dpsim:manylinux.
+          - python: cp311
+            platform: manylinux_x86_64
+            runs-on: ubuntu-24.04
+          - python: cp312
+            platform: manylinux_x86_64
+            runs-on: ubuntu-24.04
+          # ARM64 Linux — same sogno image works if multi-arch; otherwise
+          # cibuildwheel falls back to quay.io's default manylinux image.
+          - python: cp311
+            platform: manylinux_aarch64
+            runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build wheel
+        uses: pypa/cibuildwheel@v2.23.2
+        env:
+          CIBW_BUILD: "${{ matrix.python }}-${{ matrix.platform }}"
+          CIBW_MANYLINUX_X86_64_IMAGE: sogno/dpsim:manylinux
+          # Let cibuildwheel pick the aarch64 image from its defaults; override
+          # once sogno publishes sogno/dpsim:manylinux_aarch64.
+        with:
+          output-dir: dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dpsim-wheel-${{ matrix.python }}-${{ matrix.platform }}
+          path: dist/
