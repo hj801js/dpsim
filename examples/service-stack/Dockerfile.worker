@@ -9,11 +9,29 @@
 #   prometheus_client → :9109 metrics exporter
 #   boto3   → MinIO uploads (optional via MINIO_ENDPOINT)
 
-FROM python:3.11-slim
+# Pin to bookworm so the runtime shared libs (libspdlog1.10 / libfmt9) match
+# the Debian 12 libraries dpsimpy.so was linked against in the builder.
+# Python 3.11-slim-trixie ships libspdlog1.15 instead and the ABI diverges.
+FROM python:3.11-slim-bookworm
+
+# Runtime shared libs that dpsimpy.so resolves at `import dpsimpy` time.
+# libspdlog1, libfmt9, libgsl27 come from Debian 12; libsundials* is built
+# from source in the Linux dpsimpy builder and copied in below.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libspdlog1.10 libfmt9 libgsl27 libxml2 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# sundials — extracted from the same builder image that produced
+# dpsimpy.so so ABI matches. Requires `make build-linux-dpsimpy` to have
+# run first (tags the dpsim-linux-builder image).
+COPY --from=dpsim-linux-builder /usr/local/lib/libsundials_*.so* /usr/local/lib/
+RUN ldconfig
 
 RUN pip install --no-cache-dir \
         pika redis requests \
-        prometheus_client boto3
+        prometheus_client boto3 \
+        numpy \
+        opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
 
 WORKDIR /opt/dpsim
 ENV PYTHONPATH=/opt/dpsim
@@ -24,6 +42,6 @@ EXPOSE 9109
 
 # The dpsimpy .so must be bind-mounted to /opt/dpsim/dpsimpy.so at runtime.
 # For Python to import it via `import dpsimpy` the file must be named so
-# the extension suffix matches the base interpreter. Simplest workaround
-# for a dev stack: create a symlink on container start.
-CMD ["bash", "-lc", "ln -sf /opt/dpsim/dpsimpy.so /opt/dpsim/dpsimpy.cpython-311-x86_64-linux-gnu.so 2>/dev/null || true; python3 worker.py"]
+# the extension suffix matches the base interpreter. The suffix depends on
+# arch (x86_64 vs aarch64) so we ask CPython directly rather than hard-code.
+CMD ["bash", "-lc", "SUFFIX=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var(\"EXT_SUFFIX\"))'); ln -sf /opt/dpsim/dpsimpy.so /opt/dpsim/dpsimpy${SUFFIX} 2>/dev/null || true; python3 worker.py"]
