@@ -626,15 +626,28 @@ def _apply_outage(files: list[str], component_name: str, sim_id: str) -> tuple[l
     return new_files, ("applied" if applied else "not-found")
 
 
-def _build_demo_topology():
-    gnd = dpsimpy.dp.SimNode.gnd
-    n1 = dpsimpy.dp.SimNode("n1")
-    n2 = dpsimpy.dp.SimNode("n2")
-    vs = dpsimpy.dp.ph1.VoltageSource("vs")
+def _build_demo_topology(domain: Any = None):
+    """Tiny two-bus demo circuit. Built in whichever simulation domain the
+    caller asks for (DP / EMT / SP); shape is identical, only the module
+    namespace differs. P3.1: EMT works on programmatic topologies even
+    though dpsimpy.CIMReader + EMT still segfaults — so we surface EMT for
+    demo users and only fall back to DP when CIM is the model source."""
+    # Defaults to DP for backwards compat.
+    dom = domain if domain is not None else dpsimpy.Domain.DP
+    ns = {
+        dpsimpy.Domain.DP:  dpsimpy.dp,
+        dpsimpy.Domain.EMT: dpsimpy.emt,
+        dpsimpy.Domain.SP:  dpsimpy.sp,
+    }.get(dom, dpsimpy.dp)
+
+    gnd = ns.SimNode.gnd
+    n1 = ns.SimNode("n1")
+    n2 = ns.SimNode("n2")
+    vs = ns.ph1.VoltageSource("vs")
     vs.set_parameters(V_ref=complex(10000, 0), f_src=50)
-    rline = dpsimpy.dp.ph1.Resistor("r_line")
+    rline = ns.ph1.Resistor("r_line")
     rline.set_parameters(R=1.0)
-    rload = dpsimpy.dp.ph1.Resistor("r_load")
+    rload = ns.ph1.Resistor("r_load")
     rload.set_parameters(R=100.0)
     vs.connect([gnd, n1])
     rline.connect([n1, n2])
@@ -681,10 +694,13 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
 
     dom_name = params.get("domain", "DP")
     domain = DOMAIN_MAP.get(dom_name, dpsimpy.Domain.DP)
-    actual_domain = domain if dom_name != "EMT" else dpsimpy.Domain.DP
     warnings: list[str] = []
-    if dom_name == "EMT":
-        warnings.append("EMT requested; worker runs DP for this build (no EMT CIM wiring)")
+    # EMT resolution (P3.1): EMT runs fine on programmatic topologies but
+    # segfaults inside CIMpp. Decide the actual domain only after we know
+    # whether CIM is the model source (that decision happens below when we
+    # call _find_cim_bundle); default to the requested domain for now and
+    # override to DP later if we're on the CIM path.
+    actual_domain = domain
 
     timestep, finaltime, clamp_warnings = clamp_params(params)
     warnings.extend(clamp_warnings)
@@ -732,6 +748,14 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             warnings.append(f"load factor skipped (io error)")
     if cim_files:
+        # P3.1 — CIMReader + EMT segfaults inside dpsim/CIMpp (probed session 22).
+        # Fall back to DP on the CIM path only; keep EMT available for demo.
+        if dom_name == "EMT":
+            actual_domain = dpsimpy.Domain.DP
+            warnings.append(
+                "EMT via CIM not supported (dpsim/CIMpp gap); ran DP. "
+                "Use model_id=demo to exercise EMT with a programmatic topology."
+            )
         suffix = ""
         if outage_status == "applied":
             suffix += f"+outage:{outage_target}"
@@ -743,8 +767,9 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
         for i, node in enumerate(sys.nodes):
             logger_cim.log_attribute(f"v_n{i}", "v", node)
     else:
-        source = "demo-circuit"
-        sys, logged_nodes, logged_intfs = _build_demo_topology()
+        # Programmatic demo topology — EMT here actually runs EMT (P3.1).
+        source = f"demo-circuit:{dom_name.lower()}"
+        sys, logged_nodes, logged_intfs = _build_demo_topology(actual_domain)
         for name, node in logged_nodes.items():
             logger_cim.log_attribute(name, "v", node)
         for name, comp in logged_intfs.items():
