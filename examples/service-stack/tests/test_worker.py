@@ -204,6 +204,44 @@ class TestSetProgress:
 # A regression here (reintroducing an LRU) would break the WSCC-9
 # same-job×2 smoke test; this pytest keeps the intent visible in code.
 # ---------------------------------------------------------------------------
+def test_apply_load_factor_scales_loads(monkeypatch, tmp_path):
+    """P3.3 — _apply_load_factor multiplies SvPowerFlow p/q for rdf:IDs
+    prefixed with 'LOAD', leaves generators (GEN*) untouched."""
+    src = tmp_path / "WSCC-09_SV.xml"
+    src.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" '
+        '         xmlns:cim="http://iec.ch/TC57/2012/CIM-schema-cim16#">'
+        '<cim:SvPowerFlow rdf:ID="LOAD8-sv">'
+        '<cim:SvPowerFlow.p>100.0</cim:SvPowerFlow.p>'
+        '<cim:SvPowerFlow.q>35.0</cim:SvPowerFlow.q>'
+        '</cim:SvPowerFlow>'
+        '<cim:SvPowerFlow rdf:ID="GEN1-sv">'
+        '<cim:SvPowerFlow.p>-85.0</cim:SvPowerFlow.p>'
+        '<cim:SvPowerFlow.q>10.5</cim:SvPowerFlow.q>'
+        '</cim:SvPowerFlow>'
+        '</rdf:RDF>'
+    )
+    monkeypatch.setattr(worker, "JOBS_DIR", tmp_path)
+    new_files, status = worker._apply_load_factor([str(src)], 1.5, "job-lf")
+    assert status == "applied"
+    out = Path(new_files[0]).read_text()
+    # LOAD scaled 100*1.5=150 and 35*1.5=52.5.
+    assert "150.0" in out and "52.5" in out
+    # GEN1 untouched.
+    assert "-85.0" in out and "10.5" in out
+
+
+def test_apply_load_factor_skipped_when_1(monkeypatch, tmp_path):
+    """factor == 1.0 short-circuits (no copy, 'skipped')."""
+    src = tmp_path / "sv.xml"
+    src.write_text("<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'/>")
+    monkeypatch.setattr(worker, "JOBS_DIR", tmp_path)
+    new_files, status = worker._apply_load_factor([str(src)], 1.0, "job-z")
+    assert status == "skipped"
+    assert new_files == [str(src)]
+
+
 def test_apply_outage_bumps_target_rx(monkeypatch, tmp_path):
     """P3.4 — _apply_outage multiplies r and x by 1000 for the named
     ACLineSegment, leaves the rest untouched, and reports 'applied'."""

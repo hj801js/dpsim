@@ -53,6 +53,21 @@ try:
 except ImportError:  # pragma: no cover
     _BOTO_AVAILABLE = False
 
+# P2.2 — OpenTelemetry. Opt-in via OTEL_EXPORTER_OTLP_ENDPOINT; gracefully
+# degrades to no-op tracer when the library or the collector isn't there.
+try:
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.sdk.resources import Resource as _OtelResource
+    from opentelemetry.sdk.trace import TracerProvider as _OtelTracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor as _OtelBatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+        OTLPSpanExporter as _OtelHttpExporter,
+    )
+    from opentelemetry.propagate import extract as _otel_extract, inject as _otel_inject
+    _OTEL_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _OTEL_AVAILABLE = False
+
 import dpsimpy
 
 
@@ -173,6 +188,54 @@ else:
     DLQ_TOTAL = _NoopMetric()
     INFLIGHT = _NoopMetric()
     QUEUE_DEPTH = _NoopMetric()
+
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry (Jaeger-bound) tracer. No-op when OTEL_EXPORTER_OTLP_ENDPOINT
+# is unset so `make up` stays portable.
+# ---------------------------------------------------------------------------
+class _NoopTracer:
+    def start_as_current_span(self, *_a, **_kw):
+        from contextlib import nullcontext
+        return nullcontext(_NoopSpan())
+    def start_span(self, *_a, **_kw):
+        return _NoopSpan()
+
+
+class _NoopSpan:
+    def set_attribute(self, *_a, **_kw):
+        pass
+    def set_status(self, *_a, **_kw):
+        pass
+    def record_exception(self, *_a, **_kw):
+        pass
+    def end(self):
+        pass
+    def __enter__(self):
+        return self
+    def __exit__(self, *_):
+        return False
+
+
+_OTEL_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+if _OTEL_AVAILABLE and _OTEL_ENDPOINT:
+    # Resource.attributes land on every span — Jaeger uses service.name as
+    # the top-level tree label.
+    _otel_resource = _OtelResource.create({"service.name": "dpsim-worker"})
+    _otel_provider = _OtelTracerProvider(resource=_otel_resource)
+    # OTLP HTTP endpoint convention: <base>/v1/traces. We accept either the
+    # bare base (http://jaeger:4318) or an explicit /v1/traces path.
+    _otel_url = _OTEL_ENDPOINT.rstrip("/")
+    if not _otel_url.endswith("/v1/traces"):
+        _otel_url = f"{_otel_url}/v1/traces"
+    _otel_provider.add_span_processor(
+        _OtelBatchSpanProcessor(_OtelHttpExporter(endpoint=_otel_url))
+    )
+    _otel_trace.set_tracer_provider(_otel_provider)
+    tracer = _otel_trace.get_tracer("dpsim-worker")
+else:
+    tracer = _NoopTracer()
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +488,70 @@ def _find_cim_bundle(payload: dict[str, Any]) -> tuple[str | None, list[str]]:
     return None, []
 
 
+def _apply_load_factor(files: list[str], factor: float, sim_id: str) -> tuple[list[str], str]:
+    """P3.3 — scale every load's SvPowerFlow p/q by `factor`. Mutation at the
+    CIM SV level so CIMReader sees pre-scaled values; downstream dpsim
+    topology construction needs no extra code.
+
+    Identifies loads by rdf:ID prefix "LOAD" (the convention CIMpp uses for
+    every EnergyConsumer it serializes). Generators (GEN*) stay untouched so
+    the slack bus still injects whatever the load draws.
+    """
+    import shutil
+    import xml.etree.ElementTree as ET
+
+    ET.register_namespace("rdf",    "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+    ET.register_namespace("cim",    "http://iec.ch/TC57/2012/CIM-schema-cim16#")
+    ET.register_namespace("md",     "http://iec.ch/TC57/61970-552/ModelDescription/1#")
+    ET.register_namespace("entsoe", "http://entsoe.eu/Secretariat/ProfileExtension/2#")
+    rdf_id = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}ID"
+
+    if factor == 1.0 or factor <= 0:
+        return files, "skipped"
+
+    # Reuse the cim-outage dir if it already exists (outage + load factor can
+    # stack cleanly — outage mutates EQ, load factor mutates SV).
+    out_dir = JOBS_DIR / sim_id / "cim-outage"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        new_files: list[str] = []
+        for src in files:
+            dst = out_dir / Path(src).name
+            if not dst.exists():
+                shutil.copyfile(src, dst)
+            new_files.append(str(dst))
+    except Exception:
+        return files, "skipped"
+
+    applied = False
+    for path in new_files:
+        try:
+            tree = ET.parse(path)
+            root = tree.getroot()
+        except Exception:
+            continue
+        changed = False
+        for sv in list(root):
+            if not sv.tag.endswith("SvPowerFlow"):
+                continue
+            sv_id = sv.attrib.get(rdf_id, "")
+            # Only scale loads. Gens (GEN*) keep their injections.
+            if not sv_id.upper().startswith("LOAD"):
+                continue
+            for child in sv:
+                if child.tag.endswith("SvPowerFlow.p") or child.tag.endswith("SvPowerFlow.q"):
+                    try:
+                        child.text = str(float(child.text) * factor)
+                        changed = True
+                    except Exception:
+                        pass
+        if changed:
+            tree.write(path, encoding="utf-8", xml_declaration=True)
+            applied = True
+
+    return new_files, ("applied" if applied else "not-found")
+
+
 def _apply_outage(files: list[str], component_name: str, sim_id: str) -> tuple[list[str], str]:
     """P3.4 — copy the CIM bundle to a per-job dir and bump r/x of the target
     ACLineSegment by 1000× so the solver treats it as effectively open.
@@ -593,8 +720,24 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
             warnings.append(f"outage target '{outage_target}' not found in CIM; running baseline")
         else:
             warnings.append(f"outage mutation skipped (io error); running baseline")
+    # P3.3 — scalar load factor. Stacks with outage by reusing the cim-outage dir.
+    load_factor = params.get("load_factor")
+    load_factor_status = None
+    if cim_files and load_factor is not None and float(load_factor) != 1.0:
+        cim_files, load_factor_status = _apply_load_factor(cim_files, float(load_factor), str(sim_id))
+        if load_factor_status == "applied":
+            warnings.append(f"load factor applied: ×{float(load_factor):g} on all LOAD* SvPowerFlow entries")
+        elif load_factor_status == "not-found":
+            warnings.append(f"load factor skipped: no LOAD* SvPowerFlow entries in CIM")
+        else:
+            warnings.append(f"load factor skipped (io error)")
     if cim_files:
-        source = f"cim:{token}" + (f"+outage:{outage_target}" if outage_status == "applied" else "")
+        suffix = ""
+        if outage_status == "applied":
+            suffix += f"+outage:{outage_target}"
+        if load_factor_status == "applied":
+            suffix += f"+load:{float(load_factor):g}x"
+        source = f"cim:{token}{suffix}"
         # NOTE: sys is single-use. Each job rebuilds from CIM XML (docs/20).
         sys = build_cim_topology(sim_name, cim_files, actual_domain, freq=60)
         for i, node in enumerate(sys.nodes):
@@ -623,16 +766,23 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
     watcher.start()
     INFLIGHT.inc()
     t0 = time.monotonic()
-    try:
-        sim.run()
-    finally:
-        watcher.stop()
-        JOB_DURATION.labels(domain=actual_domain.name).observe(time.monotonic() - t0)
-        INFLIGHT.dec()
+    with tracer.start_as_current_span("sim.run") as run_span:
+        run_span.set_attribute("dpsim.timestep_sec", float(timestep))
+        run_span.set_attribute("dpsim.finaltime_sec", float(finaltime))
+        run_span.set_attribute("dpsim.topology_source", source)
+        try:
+            sim.run()
+        finally:
+            watcher.stop()
+            JOB_DURATION.labels(domain=actual_domain.name).observe(time.monotonic() - t0)
+            INFLIGHT.dec()
 
     upload_info: dict[str, Any] = {"uploaded": False}
     if csv_path.exists():
-        upload_info = _upload_results(csv_path, results_file)
+        with tracer.start_as_current_span("upload_results") as up_span:
+            upload_info = _upload_results(csv_path, results_file)
+            up_span.set_attribute("dpsim.upload.bytes", int(upload_info.get("bytes", 0)))
+            up_span.set_attribute("dpsim.upload.minio", bool(upload_info.get("minio")))
 
     status = {
         "results_file": results_file,
@@ -743,11 +893,24 @@ def on_msg(ch, method, props, body: bytes) -> None:
         pass
     log("job received", sim_id=sim_id, domain=domain_label)
 
+    # P2.2 — root span for the entire job. Attributes surface in Jaeger UI.
+    # Attach the root span into the current context so nested spans
+    # (sim.run, upload_results inside run_simulation) become its children.
+    root_span = tracer.start_span("dpsim-worker.on_msg")
+    root_span.set_attribute("dpsim.sim_id", str(sim_id))
+    root_span.set_attribute("dpsim.domain", str(domain_label))
+    root_span.set_attribute("dpsim.trace_id_str", trace_id)
+    ctx_token = None
+    if _OTEL_AVAILABLE and _OTEL_ENDPOINT:
+        from opentelemetry import context as _otel_context
+        from opentelemetry.trace import set_span_in_context as _otel_set_span_in_context
+        ctx_token = _otel_context.attach(_otel_set_span_in_context(root_span))
     try:
       try:
         status = run_simulation(payload)
         log("job complete", sim_id=sim_id, upload=status["upload"], source=status["topology_source"])
         JOBS_TOTAL.labels(outcome="done", domain=domain_label).inc()
+        root_span.set_attribute("dpsim.topology_source", status["topology_source"])
         ch.basic_ack(delivery_tag=method.delivery_tag)
       except Exception as e:
         tb = traceback.format_exc()
@@ -798,6 +961,10 @@ def on_msg(ch, method, props, body: bytes) -> None:
                 ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
     finally:
         CURRENT_TRACE_ID.reset(token)
+        if ctx_token is not None:
+            from opentelemetry import context as _otel_context
+            _otel_context.detach(ctx_token)
+        root_span.end()
 
 
 def _sweep_job_dirs() -> int:
