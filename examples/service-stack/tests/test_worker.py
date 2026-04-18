@@ -273,6 +273,46 @@ def test_apply_outage_bumps_target_rx(monkeypatch, tmp_path):
     assert ">20.0<" in content and ">60.0<" in content
 
 
+def test_apply_outage_handles_transformer(monkeypatch, tmp_path):
+    """P3.4b — outage target = PowerTransformerEnd also scales r/x (and r0/x0).
+    Both ends share the transformer's name so one match hits both."""
+    src = tmp_path / "WSCC-09_EQ.xml"
+    src.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" '
+        '         xmlns:cim="http://iec.ch/TC57/2012/CIM-schema-cim16#">'
+        '<cim:PowerTransformerEnd rdf:ID="e1">'
+        '<cim:IdentifiedObject.name>TR14</cim:IdentifiedObject.name>'
+        '<cim:PowerTransformerEnd.r>0.5</cim:PowerTransformerEnd.r>'
+        '<cim:PowerTransformerEnd.x>2.0</cim:PowerTransformerEnd.x>'
+        '<cim:PowerTransformerEnd.r0>0.5</cim:PowerTransformerEnd.r0>'
+        '<cim:PowerTransformerEnd.x0>2.0</cim:PowerTransformerEnd.x0>'
+        '</cim:PowerTransformerEnd>'
+        '<cim:PowerTransformerEnd rdf:ID="e2">'
+        '<cim:IdentifiedObject.name>TR14</cim:IdentifiedObject.name>'
+        '<cim:PowerTransformerEnd.r>0.5</cim:PowerTransformerEnd.r>'
+        '<cim:PowerTransformerEnd.x>2.0</cim:PowerTransformerEnd.x>'
+        '<cim:PowerTransformerEnd.r0>0.5</cim:PowerTransformerEnd.r0>'
+        '<cim:PowerTransformerEnd.x0>2.0</cim:PowerTransformerEnd.x0>'
+        '</cim:PowerTransformerEnd>'
+        '<cim:PowerTransformerEnd rdf:ID="e3">'
+        '<cim:IdentifiedObject.name>TR27</cim:IdentifiedObject.name>'
+        '<cim:PowerTransformerEnd.r>1.0</cim:PowerTransformerEnd.r>'
+        '<cim:PowerTransformerEnd.x>3.0</cim:PowerTransformerEnd.x>'
+        '</cim:PowerTransformerEnd>'
+        '</rdf:RDF>'
+    )
+    monkeypatch.setattr(worker, "JOBS_DIR", tmp_path)
+    new_files, status = worker._apply_outage([str(src)], "TR14", "job-tx")
+    assert status == "applied"
+    out = Path(new_files[0]).read_text()
+    # Both TR14 ends scaled: 500.0 = 0.5 * 1000 (twice in the output, no guard).
+    assert out.count("500.0") >= 4, "TR14 r/x/r0/x0 should all be scaled on both ends"
+    assert "2000.0" in out
+    # TR27 untouched.
+    assert ">1.0<" in out and ">3.0<" in out
+
+
 def test_apply_outage_not_found(monkeypatch, tmp_path):
     """Outage component not present → status 'not-found', unchanged copy."""
     src = tmp_path / "EQ.xml"

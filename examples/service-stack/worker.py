@@ -554,17 +554,24 @@ def _apply_load_factor(files: list[str], factor: float, sim_id: str) -> tuple[li
 
 def _apply_outage(files: list[str], component_name: str, sim_id: str) -> tuple[list[str], str]:
     """P3.4 — copy the CIM bundle to a per-job dir and bump r/x of the target
-    ACLineSegment by 1000× so the solver treats it as effectively open.
+    equipment by 1000× so the solver treats it as effectively open.
+
+    Supports two element types:
+      * cim:ACLineSegment    — bump ACLineSegment.r and .x
+      * cim:PowerTransformerEnd — bump PowerTransformerEnd.r, .x, .r0, .x0
+        (both ends share cim:IdentifiedObject.name = PowerTransformer.name,
+         so one component_name matches both ends and scales the series
+         impedance uniformly).
 
     Returns (new_files, status) where status is one of:
       * "applied"   — match found and mutated
-      * "not-found" — bundle copied but no ACLineSegment named <component_name>
+      * "not-found" — bundle copied but no matching element
       * "skipped"   — something went wrong; original files returned unchanged
 
     Using a 1000× bump instead of rip-out-the-element because the latter
     would also require removing dangling Terminals and may desync
     TopologicalIsland references in the TP/SV files. r/x bump keeps the
-    topology graph intact while making the line carry ~0 current.
+    topology graph intact while making the element carry ~0 current.
     """
     import shutil
     import xml.etree.ElementTree as ET
@@ -593,6 +600,15 @@ def _apply_outage(files: list[str], component_name: str, sim_id: str) -> tuple[l
     except Exception:
         return files, "skipped"
 
+    # Suffixes of elements we can scale, and which child impedance fields to
+    # multiply. Keep ACLineSegment first so a component name that collides
+    # (unlikely but possible) prefers the line.
+    outage_targets = [
+        ("ACLineSegment",      ("ACLineSegment.r", "ACLineSegment.x")),
+        ("PowerTransformerEnd", ("PowerTransformerEnd.r", "PowerTransformerEnd.x",
+                                 "PowerTransformerEnd.r0", "PowerTransformerEnd.x0")),
+    ]
+
     applied = False
     for path in new_files:
         try:
@@ -602,7 +618,15 @@ def _apply_outage(files: list[str], component_name: str, sim_id: str) -> tuple[l
             continue
         changed = False
         for seg in list(root):
-            if not is_cim_ns(seg.tag) or not seg.tag.endswith("ACLineSegment"):
+            if not is_cim_ns(seg.tag):
+                continue
+            # Match any outage target whose tag ends with one of the suffixes.
+            match_fields = None
+            for suffix, fields in outage_targets:
+                if seg.tag.endswith(suffix):
+                    match_fields = fields
+                    break
+            if match_fields is None:
                 continue
             name_el = None
             for child in seg:
@@ -611,9 +635,10 @@ def _apply_outage(files: list[str], component_name: str, sim_id: str) -> tuple[l
                     break
             if name_el is None or (name_el.text or "").strip() != component_name:
                 continue
-            # Found the target. Bump r/x.
+            # Found the target. Bump the listed impedance fields by 1000×.
             for child in seg:
-                if child.tag.endswith("ACLineSegment.r") or child.tag.endswith("ACLineSegment.x"):
+                local_tag = child.tag.rsplit("}", 1)[-1] if "}" in child.tag else child.tag
+                if local_tag in match_fields:
                     try:
                         child.text = str(float(child.text) * 1000.0)
                         changed = True
