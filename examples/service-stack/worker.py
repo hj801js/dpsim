@@ -138,6 +138,11 @@ MIN_TIMESTEP_SEC = 1e-5
 # duration. Typical EMT: 0.01–0.1 ms step.
 TIMEUNIT_MS_TO_SEC = 1e-3
 
+# ZIP local-file-header magic. Must stay in lock-step with dpsim-api's
+# ZIP_MAGIC in routes.rs — an upload the API accepts as a ZIP is resolved
+# the same way here, and vice versa.
+ZIP_MAGIC = b"PK\x03\x04"
+
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics — counters / histogram / gauge all no-op if the client
@@ -453,8 +458,8 @@ def _resolve_uploaded_model(model_id: str) -> list[str]:
     except Exception:
         return []
 
-    # Sniff the magic bytes: ZIP starts with PK\x03\x04.
-    if body[:4] == b"PK\x03\x04":
+    # Sniff the magic bytes.
+    if body[:4] == ZIP_MAGIC:
         try:
             with zipfile.ZipFile(io.BytesIO(body)) as z:
                 # Defense against ZIP slip: reject any entry whose resolved
@@ -558,8 +563,14 @@ def _apply_load_factor(files: list[str], factor: float, sim_id: str) -> tuple[li
                     try:
                         child.text = str(float(child.text) * factor)
                         changed = True
-                    except Exception:
-                        pass
+                    except (TypeError, ValueError) as exc:
+                        # Non-numeric or missing child.text — not fatal, just
+                        # means this entry stays unscaled. Log with the sv_id
+                        # so operators can see which load was skipped.
+                        logger.debug(
+                            "load_factor skip sv=%s tag=%s text=%r: %s",
+                            sv_id, child.tag, child.text, exc,
+                        )
         if changed:
             tree.write(path, encoding="utf-8", xml_declaration=True)
             applied = True
