@@ -202,6 +202,19 @@ HTTP_CODE=$(printf "%s" "$OVERSIZE" | curl -s -o /dev/null -w '%{http_code}' -X 
 [[ "$HTTP_CODE" == "413" ]] && ok "/models rejected 20 MiB payload (HTTP $HTTP_CODE)" \
   || fail "/models oversize expected 413, got $HTTP_CODE"
 
+# C hardening — malformed XML + DOCTYPE both rejected with 400. ZIP (PK magic)
+# passes through because the worker handles ZIP extraction itself.
+HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/models" \
+  -H 'Content-Type: application/xml' --data '<cim><unclosed>')
+[[ "$HTTP_CODE" == "400" ]] && ok "/models rejected malformed XML (HTTP $HTTP_CODE)" \
+  || fail "/models malformed XML expected 400, got $HTTP_CODE"
+
+HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/models" \
+  -H 'Content-Type: application/xml' \
+  --data '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x "y">]><r>&x;</r>')
+[[ "$HTTP_CODE" == "400" ]] && ok "/models rejected DOCTYPE (HTTP $HTTP_CODE)" \
+  || fail "/models DOCTYPE expected 400, got $HTTP_CODE"
+
 # 9c. dynamic CIM loading — upload a zipped WSCC-9 bundle and verify the worker
 # materializes the cache + runs CIMReader on it (topology_source = cim:<id>).
 WSCC9_DIR=$(python3 -c '
