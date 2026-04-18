@@ -33,10 +33,23 @@ RUN pip install --no-cache-dir \
         numpy \
         opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
 
+# Non-root runtime user — defense in depth against a ZIP slip / arbitrary
+# write inside the model-cache dir (docs/43 #1). The worker only needs:
+#   * read  /opt/dpsim/dpsimpy.so          (bind-mounted from host)
+#   * read  /usr/local/lib/libsundials_*   (baked in above)
+#   * write MODELS_CACHE_DIR + JOBS_DIR    (both under /tmp by default)
+# /opt/dpsim itself is owned by the new user so the CMD symlink can be
+# created at container start. The bind-mounted .so must be world-readable
+# on the host (0644) — our `make build-linux-dpsimpy` output already is.
+RUN useradd --create-home --shell /usr/sbin/nologin --uid 10001 dpsim
+
 WORKDIR /opt/dpsim
 ENV PYTHONPATH=/opt/dpsim
 
-COPY worker.py /opt/dpsim/worker.py
+COPY --chown=dpsim:dpsim worker.py /opt/dpsim/worker.py
+RUN chown -R dpsim:dpsim /opt/dpsim
+
+USER dpsim:dpsim
 
 EXPOSE 9109
 
