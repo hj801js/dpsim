@@ -894,9 +894,23 @@ def on_msg(ch, method, props, body: bytes) -> None:
     log("job received", sim_id=sim_id, domain=domain_label)
 
     # P2.2 — root span for the entire job. Attributes surface in Jaeger UI.
-    # Attach the root span into the current context so nested spans
-    # (sim.run, upload_results inside run_simulation) become its children.
-    root_span = tracer.start_span("dpsim-worker.on_msg")
+    # Continues the parent trace from the AMQP traceparent header so the
+    # whole HTTP → AMQP → worker chain lands in a single Jaeger waterfall.
+    parent_ctx = None
+    if _OTEL_AVAILABLE and _OTEL_ENDPOINT:
+        headers = (props.headers or {}) if props else {}
+        # Only carry headers the W3C propagator cares about. AMQP often gives
+        # us bytes; decode them so TraceContextTextMapPropagator sees strings.
+        carrier = {}
+        for k in ("traceparent", "tracestate"):
+            v = headers.get(k)
+            if isinstance(v, (bytes, bytearray)):
+                v = v.decode("utf-8", errors="ignore")
+            if v:
+                carrier[k] = v
+        if carrier:
+            parent_ctx = _otel_extract(carrier)
+    root_span = tracer.start_span("dpsim-worker.on_msg", context=parent_ctx)
     root_span.set_attribute("dpsim.sim_id", str(sim_id))
     root_span.set_attribute("dpsim.domain", str(domain_label))
     root_span.set_attribute("dpsim.trace_id_str", trace_id)
