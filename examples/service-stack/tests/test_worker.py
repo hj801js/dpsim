@@ -113,6 +113,42 @@ class TestFindCimBundle:
         assert token == "abc123"
         assert sorted(Path(f).name for f in files) == ["EQ.xml", "TP.xml"]
 
+    def test_malicious_zip_slip_rejected(self, monkeypatch, tmp_path):
+        """A ZIP with an entry that resolves outside the cache dir must not
+        be extracted. Regression for the ZIP-slip finding in docs/43 #1."""
+        import io
+        import zipfile
+
+        monkeypatch.setattr(worker, "MODELS_CACHE_DIR", tmp_path)
+        # Build an in-memory zip with one safe entry and one path-traversal.
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("ok.xml", "<cim/>")
+            z.writestr("../../pwned.xml", "<evil/>")
+        body = buf.getvalue()
+
+        class FakeMetaResp:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self):             return {"data": {"url": "/raw/evil"}}
+        class FakeRawResp:
+            status_code = 200
+            content = body
+            def raise_for_status(self): pass
+
+        def fake_get(url, timeout=None):
+            return FakeMetaResp() if "api/files" in url else FakeRawResp()
+
+        monkeypatch.setattr(worker.requests, "get", fake_get)
+        files = worker._resolve_uploaded_model("evilzip")
+
+        assert files == []  # rejected outright
+        assert not (tmp_path.parent / "pwned.xml").exists()
+        # Cache dir may exist but should hold nothing.
+        cache = tmp_path / "evilzip"
+        if cache.exists():
+            assert list(cache.iterdir()) == []
+
 
 # ---------------------------------------------------------------------------
 # set_status — writes redis sidechannel key with warnings when supplied

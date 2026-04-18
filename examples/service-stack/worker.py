@@ -457,6 +457,21 @@ def _resolve_uploaded_model(model_id: str) -> list[str]:
     if body[:4] == b"PK\x03\x04":
         try:
             with zipfile.ZipFile(io.BytesIO(body)) as z:
+                # Defense against ZIP slip: reject any entry whose resolved
+                # path escapes the per-model cache dir (absolute paths,
+                # `../..` traversal, symlinks). stdlib extractall doesn't
+                # guard against this on Linux as of 3.11.
+                cache_resolved = cache.resolve()
+                for info in z.infolist():
+                    dest = (cache / info.filename).resolve()
+                    try:
+                        dest.relative_to(cache_resolved)
+                    except ValueError:
+                        logger.warning(
+                            "rejected zip entry outside cache dir: %s",
+                            info.filename,
+                        )
+                        return []
                 z.extractall(cache)
         except Exception:
             return []
