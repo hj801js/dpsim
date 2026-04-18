@@ -18,12 +18,14 @@ file-service stub.
 """
 from __future__ import annotations
 
+import contextvars
 import glob
 import json
 import logging
 import os
 import signal
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -32,6 +34,24 @@ from typing import Any
 import pika
 import redis
 import requests
+
+try:
+    from prometheus_client import (
+        Counter as _PromCounter,
+        Histogram as _PromHistogram,
+        Gauge as _PromGauge,
+        start_http_server as _prom_start_http_server,
+    )
+    _PROMETHEUS_AVAILABLE = True
+except ImportError:  # pragma: no cover — optional at dev time
+    _PROMETHEUS_AVAILABLE = False
+
+try:
+    import boto3
+    from botocore.client import Config as _BotoConfig
+    _BOTO_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _BOTO_AVAILABLE = False
 
 import dpsimpy
 
@@ -57,8 +77,23 @@ AMQP_PREFETCH = int(os.environ.get("AMQP_PREFETCH", 1))
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 FILE_SERVICE_URL = os.environ.get("FILE_SERVICE_URL", "http://127.0.0.1:18080")
 
+# MinIO / S3-compatible object store (Phase 2.4). Opt-in — if MINIO_ENDPOINT
+# is set, CSV results upload goes through boto3 in addition to the legacy
+# file-service. Bucket must exist; worker does not create it.
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT")  # e.g. http://localhost:9000
+MINIO_BUCKET   = os.environ.get("MINIO_BUCKET", "dpsim-results")
+MINIO_ACCESS   = os.environ.get("MINIO_ACCESS_KEY", "dpsim")
+MINIO_SECRET   = os.environ.get("MINIO_SECRET_KEY", "dpsim12345")
+
+# Prometheus metrics HTTP port. 0 disables the exporter (e.g. pytest runs).
+PROMETHEUS_PORT = int(os.environ.get("DPSIM_PROMETHEUS_PORT", 9109))
+
 JOBS_DIR = Path(os.environ.get("DPSIM_JOBS_DIR", "/tmp/dpsim_jobs"))
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Hours to keep per-job output directories. Set to 0 to disable purging.
+# The worker sweeps on startup and then hourly on a daemon thread.
+JOBS_RETENTION_HOURS = float(os.environ.get("DPSIM_JOBS_RETENTION_HOURS", 24))
 
 # DPsim build dir to find bundled CIM test data. Override to your clone.
 DPSIM_BUILD = Path(os.environ.get(
@@ -72,8 +107,8 @@ DOMAIN_MAP = {
     "EMT": dpsimpy.Domain.EMT,
 }
 
-# Known CIM bundles, keyed by substring that may appear in a model URL.
-# Extend this dict to accept more models.
+# Known CIM bundles, keyed by the file-service model_id (tail of the model
+# URL, with any extension stripped). Extend this dict to accept more models.
 CIM_BUNDLES = {
     "wscc9": sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/WSCC-09/WSCC-09/*.xml"))),
     "ieee39": sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/IEEE-39/*.xml"))),
@@ -87,6 +122,57 @@ MIN_TIMESTEP_SEC = 1e-5
 # divide by 1000 at the worker boundary. Typical DP: 1 ms step, 1000 ms
 # duration. Typical EMT: 0.01–0.1 ms step.
 TIMEUNIT_MS_TO_SEC = 1e-3
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics — counters / histogram / gauge all no-op if the client
+# library is missing so unit tests run without the dep. Exporter starts in
+# main(); pytest doesn't import main so nothing binds to a port.
+# ---------------------------------------------------------------------------
+class _NoopMetric:
+    def labels(self, **_):
+        return self
+    def inc(self, *_a, **_k):
+        pass
+    def dec(self, *_a, **_k):
+        pass
+    def observe(self, *_a, **_k):
+        pass
+    def set(self, *_a, **_k):
+        pass
+
+
+if _PROMETHEUS_AVAILABLE:
+    JOBS_TOTAL = _PromCounter(
+        "dpsim_worker_jobs_total",
+        "Total simulation jobs processed by the worker, labelled by outcome.",
+        ["outcome", "domain"],
+    )
+    JOB_DURATION = _PromHistogram(
+        "dpsim_worker_job_duration_seconds",
+        "Wall-clock duration of sim.run() per job (not including upload).",
+        ["domain"],
+        buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0),
+    )
+    DLQ_TOTAL = _PromCounter(
+        "dpsim_worker_dlq_total",
+        "Messages that exhausted AMQP_MAX_RETRY and were parked on the DLQ.",
+    )
+    INFLIGHT = _PromGauge(
+        "dpsim_worker_inflight_jobs",
+        "Jobs currently being processed (0..AMQP_PREFETCH).",
+    )
+    QUEUE_DEPTH = _PromGauge(
+        "dpsim_worker_queue_depth",
+        "Messages waiting on an AMQP queue as seen by the worker's passive declare.",
+        ["queue"],
+    )
+else:
+    JOBS_TOTAL = _NoopMetric()
+    JOB_DURATION = _NoopMetric()
+    DLQ_TOTAL = _NoopMetric()
+    INFLIGHT = _NoopMetric()
+    QUEUE_DEPTH = _NoopMetric()
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +199,18 @@ h.setFormatter(JsonFormatter())
 logger.addHandler(h)
 
 
+# P2.2 trace-id propagation. dpsim-api stamps x-trace-id into the AMQP
+# headers and inlines it in parameters; on_msg pulls whichever is present
+# into this contextvar, and every log() / set_status() / set_progress()
+# call pulls it back out — no plumbing through every function arg.
+CURRENT_TRACE_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "dpsim_trace_id", default="")
+
+
 def log(msg: str, level: str = "info", **context: Any) -> None:
+    tid = context.pop("trace_id", None) or CURRENT_TRACE_ID.get()
+    if tid:
+        context["trace_id"] = tid
     extra = {f"ctx_{k}": v for k, v in context.items()}
     getattr(logger, level)(msg, extra=extra)
 
@@ -131,6 +228,7 @@ def set_status(
     status: str,
     error: str | None = None,
     warnings: list[str] | None = None,
+    progress: float | None = None,
 ) -> None:
     key = f"dpsim:sim:{sim_id}:status"
     value: dict[str, Any] = {"status": status}
@@ -138,14 +236,85 @@ def set_status(
         value["error"] = error
     if warnings:
         value["warnings"] = warnings
+    if progress is not None:
+        # Clamp to [0, 100] so UI never shows >100% or negative values.
+        value["progress"] = max(0.0, min(100.0, float(progress)))
+    tid = CURRENT_TRACE_ID.get()
+    if tid:
+        value["trace_id"] = tid
     _redis.set(key, json.dumps(value))
     log("status update", sim_id=sim_id, status=status, error=error or "",
-        warnings=warnings or [])
+        warnings=warnings or [], progress=value.get("progress", ""))
+
+
+def set_progress(sim_id: str | int, progress: float) -> None:
+    """Update only the `progress` field of the existing status key.
+
+    Background progress watcher calls this every ~200ms while the simulator is
+    running, so we avoid bouncing status back to "running" or dropping accrued
+    warnings. Best-effort — a stale status (job completed in parallel) is
+    merely overwritten with "running" and re-corrected by the completion path.
+    """
+    key = f"dpsim:sim:{sim_id}:status"
+    try:
+        raw = _redis.get(key)
+        current = json.loads(raw) if raw else {"status": "running"}
+    except Exception:
+        current = {"status": "running"}
+    current["progress"] = max(0.0, min(100.0, float(progress)))
+    _redis.set(key, json.dumps(current))
 
 
 def get_status(sim_id: str | int) -> dict[str, Any] | None:
     raw = _redis.get(f"dpsim:sim:{sim_id}:status")
     return json.loads(raw) if raw else None
+
+
+class _ProgressWatcher:
+    """Sample the CSV output file while dpsim runs and publish an approximate
+    progress percentage to redis. Approximate because dpsimpy doesn't expose a
+    step callback — we infer progress from row count vs expected rows.
+    Runs as a daemon thread; stops when `stop()` is set or the file vanishes.
+    """
+
+    def __init__(self, sim_id: str | int, csv_path: Path,
+                 expected_rows: int, poll_interval: float = 0.2) -> None:
+        self.sim_id = sim_id
+        self.csv_path = csv_path
+        # +1 for the header row dpsim writes once at the start.
+        self.expected_rows = max(1, expected_rows)
+        self.poll_interval = poll_interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                         name=f"progress-{sim_id}")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def _loop(self) -> None:
+        last_sent = -1.0
+        while not self._stop.is_set():
+            try:
+                if self.csv_path.exists():
+                    # Cheap row estimate: file size / avg_line_bytes is wrong
+                    # for WSCC-9 (19 cols, ~300 bytes/line) vs demo (3 cols, ~60
+                    # bytes). Use line count — file grows append-only.
+                    with self.csv_path.open("rb") as f:
+                        rows = sum(1 for _ in f) - 1  # minus header
+                    pct = min(95.0, max(0.0, rows / self.expected_rows * 100.0))
+                    # Cap at 95% during run; completion path writes 100%.
+                    if pct - last_sent >= 1.0:
+                        set_progress(self.sim_id, pct)
+                        last_sent = pct
+            except Exception:
+                # Never let the watcher kill the job — best-effort only.
+                pass
+            if self._stop.wait(self.poll_interval):
+                return
 
 
 # ---------------------------------------------------------------------------
@@ -171,12 +340,88 @@ def build_cim_topology(sim_name: str, files: list[str], domain: Any, freq: float
 # ---------------------------------------------------------------------------
 # Topology builders
 # ---------------------------------------------------------------------------
+MODELS_CACHE_DIR = Path(os.environ.get(
+    "DPSIM_MODELS_CACHE_DIR", "/tmp/dpsim_models"))
+MODELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _extract_model_id(url: str) -> str:
+    """Strip query/fragment/extension from a file-service URL tail."""
+    tail = url.rsplit("/", 1)[-1].lower()
+    return tail.split("?", 1)[0].split("#", 1)[0].rsplit(".", 1)[0]
+
+
+def _resolve_uploaded_model(model_id: str) -> list[str]:
+    """Materialize an uploaded model onto local disk and return the list of
+    .xml files to feed the CIMReader. Supports two body formats:
+
+    * raw CIM XML — stored as `<cache>/<id>/<id>.xml`
+    * ZIP of XMLs — extracted to `<cache>/<id>/*.xml`
+
+    On repeat calls the cache directory is reused. Returns [] on any error
+    so the caller can fall back to the demo topology with a clear warning.
+    """
+    import io
+    import zipfile
+
+    cache = MODELS_CACHE_DIR / model_id
+    if cache.is_dir():
+        existing = sorted(str(p) for p in cache.glob("*.xml"))
+        if existing:
+            return existing
+    cache.mkdir(parents=True, exist_ok=True)
+
+    # file-service's GET /api/files/<id> returns {data: {url: "<raw>"}}.
+    # We hit that raw URL to fetch the bytes.
+    try:
+        meta = requests.get(
+            f"{FILE_SERVICE_URL}/api/files/{model_id}", timeout=(3, 10),
+        )
+        meta.raise_for_status()
+        raw_url = meta.json().get("data", {}).get("url")
+        if not raw_url:
+            return []
+        # raw_url is relative to file-service (e.g. "/raw/<id>"). Resolve.
+        if raw_url.startswith("/"):
+            raw_url = f"{FILE_SERVICE_URL}{raw_url}"
+        payload = requests.get(raw_url, timeout=(5, 30))
+        payload.raise_for_status()
+        body = payload.content
+    except Exception:
+        return []
+
+    # Sniff the magic bytes: ZIP starts with PK\x03\x04.
+    if body[:4] == b"PK\x03\x04":
+        try:
+            with zipfile.ZipFile(io.BytesIO(body)) as z:
+                z.extractall(cache)
+        except Exception:
+            return []
+    else:
+        (cache / f"{model_id}.xml").write_bytes(body)
+
+    # Collect XMLs at any depth (some bundles have a top-level folder).
+    return sorted(str(p) for p in cache.rglob("*.xml"))
+
+
 def _find_cim_bundle(payload: dict[str, Any]) -> tuple[str | None, list[str]]:
+    """Resolve the payload's model URL list to a concrete CIM file set.
+
+    Priority:
+      1. hard-coded builds baked into dpsimpy (`CIM_BUNDLES`)
+      2. uploaded bundle cached by file-service model_id
+    Returns (token, files) — token is the cache subdir name or builtin key.
+    """
     for url in payload.get("model", {}).get("url", []):
-        tail = url.rsplit("/", 1)[-1].lower()
-        for token, files in CIM_BUNDLES.items():
-            if token in tail and files:
-                return token, files
+        model_id = _extract_model_id(url)
+        # 1 — baked bundles
+        files = CIM_BUNDLES.get(model_id)
+        if files:
+            return model_id, files
+        # 2 — uploaded bundle
+        uploaded = _resolve_uploaded_model(model_id)
+        if uploaded:
+            return model_id, uploaded
     return None, []
 
 
@@ -243,6 +488,18 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
     timestep, finaltime, clamp_warnings = clamp_params(params)
     warnings.extend(clamp_warnings)
 
+    # Load profile: dpsim-api wraps the URL as {"type":"url-list","url":[...]} when
+    # the user supplied one, else leaves the field as an empty string. The worker
+    # has no time-series Load support yet, so surface the fact to the user
+    # instead of silently dropping their input.
+    lp = payload.get("load_profile")
+    lp_urls = lp.get("url") if isinstance(lp, dict) else None
+    if lp_urls:
+        warnings.append(
+            f"load_profile ({lp_urls[0]}) ignored — time-series Load wiring "
+            f"not yet implemented (docs/24 Phase 3.3)"
+        )
+
     sim_name = f"job_{results_file}"
     # Logger.set_log_dir is a dpsimpy process-global; relying on AMQP_PREFETCH=1
     # to guarantee no two jobs race on it. Do not raise prefetch without moving
@@ -271,22 +528,26 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
     sim.set_final_time(finaltime)
     sim.set_domain(actual_domain)
     sim.add_logger(logger_cim)
-    sim.run()
 
+    # H12: publish approximate progress while sim.run() blocks. Watcher reads
+    # the partially-written CSV to estimate row count vs expected steps.
     csv_path = job_dir / f"{sim_name}.csv"
-    upload_info = {"uploaded": False}
+    expected_rows = max(1, int(finaltime / timestep))
+    watcher = _ProgressWatcher(sim_id, csv_path, expected_rows)
+    set_progress(sim_id, 0.0)
+    watcher.start()
+    INFLIGHT.inc()
+    t0 = time.monotonic()
+    try:
+        sim.run()
+    finally:
+        watcher.stop()
+        JOB_DURATION.labels(domain=actual_domain.name).observe(time.monotonic() - t0)
+        INFLIGHT.dec()
+
+    upload_info: dict[str, Any] = {"uploaded": False}
     if csv_path.exists():
-        try:
-            r = requests.put(
-                f"{FILE_SERVICE_URL}/api/files/{results_file}",
-                data=csv_path.read_bytes(),
-                headers={"Content-Type": "text/csv"},
-                timeout=10,
-            )
-            r.raise_for_status()
-            upload_info = {"uploaded": True, "bytes": csv_path.stat().st_size}
-        except Exception as e:
-            upload_info = {"uploaded": False, "error": str(e)}
+        upload_info = _upload_results(csv_path, results_file)
 
     status = {
         "results_file": results_file,
@@ -302,13 +563,68 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
         "upload": upload_info,
     }
     (job_dir / "status.json").write_text(json.dumps(status, indent=2))
-    set_status(sim_id, "done", warnings=warnings or None)
+    set_status(sim_id, "done", warnings=warnings or None, progress=100.0)
     return status
 
 
 # ---------------------------------------------------------------------------
 # AMQP consumer with DLQ routing
 # ---------------------------------------------------------------------------
+_s3_client: Any = None
+
+
+def _get_s3_client() -> Any:
+    """Lazily construct the boto3 client. Returns None if MINIO disabled or
+    the boto3 dep is missing. Caches across calls to avoid re-handshake."""
+    global _s3_client
+    if _s3_client is not None:
+        return _s3_client
+    if not (MINIO_ENDPOINT and _BOTO_AVAILABLE):
+        return None
+    _s3_client = boto3.client(
+        "s3",
+        endpoint_url=MINIO_ENDPOINT,
+        aws_access_key_id=MINIO_ACCESS,
+        aws_secret_access_key=MINIO_SECRET,
+        config=_BotoConfig(signature_version="s3v4"),
+        region_name="us-east-1",
+    )
+    return _s3_client
+
+
+def _upload_results(csv_path: Path, results_file: str) -> dict[str, Any]:
+    """Upload the simulation CSV to MinIO (if configured) and the legacy
+    file-service (always). Returns the legacy upload_info dict; MinIO status
+    is merged in under `minio` so the API payload is backward-compatible."""
+    info: dict[str, Any] = {"uploaded": False}
+    # Legacy file-service (dpsim-api reads from this).
+    try:
+        r = requests.put(
+            f"{FILE_SERVICE_URL}/api/files/{results_file}",
+            data=csv_path.read_bytes(),
+            headers={"Content-Type": "text/csv"},
+            timeout=(5, 60),
+        )
+        r.raise_for_status()
+        info = {"uploaded": True, "bytes": csv_path.stat().st_size}
+    except Exception as e:
+        info = {"uploaded": False, "error": str(e)}
+    # MinIO (object store of record for Phase 4 UI).
+    s3 = _get_s3_client()
+    if s3 is not None:
+        key = f"{results_file}.csv"
+        try:
+            with csv_path.open("rb") as f:
+                s3.put_object(
+                    Bucket=MINIO_BUCKET, Key=key, Body=f,
+                    ContentType="text/csv",
+                )
+            info["minio"] = {"bucket": MINIO_BUCKET, "key": key}
+        except Exception as e:
+            info["minio"] = {"error": str(e)[:200]}
+    return info
+
+
 def _retry_count(props: pika.spec.BasicProperties) -> int:
     headers = (props.headers or {}).copy()
     return int(headers.get("x-retry-count", 0))
@@ -322,18 +638,38 @@ def on_msg(ch, method, props, body: bytes) -> None:
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
         return
 
+    # P2.2 — pick up the trace id the publisher set. Header wins; fall back
+    # to the body copy (survives DLQ/requeue paths that drop headers).
+    header_tid = (props.headers or {}).get("x-trace-id") if props else None
+    payload_tid = payload.get("parameters", {}).get("trace_id")
+    trace_id = str(header_tid or payload_tid or "")
+    token = CURRENT_TRACE_ID.set(trace_id)
+
     sim_id = payload.get("parameters", {}).get("results_file", "?")
-    log("job received", sim_id=sim_id, domain=payload.get("parameters", {}).get("domain"))
+    domain_label = payload.get("parameters", {}).get("domain") or "unknown"
+    # Cheap queue-depth snapshot: passive declare returns current message_count.
+    # Done inline so we don't need a second AMQP connection + thread.
+    try:
+        q = ch.queue_declare(queue=AMQP_QUEUE, passive=True)
+        QUEUE_DEPTH.labels(queue=AMQP_QUEUE).set(float(q.method.message_count))
+        dlq = ch.queue_declare(queue=AMQP_DLQ, passive=True)
+        QUEUE_DEPTH.labels(queue=AMQP_DLQ).set(float(dlq.method.message_count))
+    except Exception:
+        pass
+    log("job received", sim_id=sim_id, domain=domain_label)
 
     try:
+      try:
         status = run_simulation(payload)
         log("job complete", sim_id=sim_id, upload=status["upload"], source=status["topology_source"])
+        JOBS_TOTAL.labels(outcome="done", domain=domain_label).inc()
         ch.basic_ack(delivery_tag=method.delivery_tag)
-    except Exception as e:
+      except Exception as e:
         tb = traceback.format_exc()
         retry = _retry_count(props)
         log("job failed", level="error", sim_id=sim_id,
             error=str(e)[:200], retry=retry, traceback=tb[-500:])
+        JOBS_TOTAL.labels(outcome="failed", domain=domain_label).inc()
         set_status(sim_id, "failed", error=str(e))
 
         # The nack/republish pair below must be atomic from the broker's
@@ -353,6 +689,7 @@ def on_msg(ch, method, props, body: bytes) -> None:
                     }),
                 )
                 ch.basic_ack(delivery_tag=method.delivery_tag)
+                DLQ_TOTAL.inc()
                 log("moved to DLQ", level="warning", sim_id=sim_id)
             except Exception as pub_err:
                 log("DLQ publish failed — requeueing for broker redelivery",
@@ -374,6 +711,45 @@ def on_msg(ch, method, props, body: bytes) -> None:
                 log("retry publish failed — requeueing for broker redelivery",
                     level="error", sim_id=sim_id, error=str(pub_err)[:200])
                 ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+    finally:
+        CURRENT_TRACE_ID.reset(token)
+
+
+def _sweep_job_dirs() -> int:
+    """Remove job dirs under JOBS_DIR older than JOBS_RETENTION_HOURS.
+    Returns the number of directories removed. Best-effort — never raises."""
+    if JOBS_RETENTION_HOURS <= 0 or not JOBS_DIR.exists():
+        return 0
+    import shutil
+    cutoff = time.time() - JOBS_RETENTION_HOURS * 3600
+    removed = 0
+    for entry in JOBS_DIR.iterdir():
+        try:
+            if not entry.is_dir():
+                continue
+            # mtime reflects last write — good enough proxy for "finished".
+            if entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+        except Exception:
+            continue
+    return removed
+
+
+def _start_retention_thread() -> None:
+    def _loop() -> None:
+        while True:
+            try:
+                n = _sweep_job_dirs()
+                if n:
+                    log("retention sweep", removed=n, dir=str(JOBS_DIR),
+                        hours=JOBS_RETENTION_HOURS)
+            except Exception as e:
+                log("retention sweep failed",
+                    level="warning", error=str(e)[:120])
+            time.sleep(3600)  # hourly
+    t = threading.Thread(target=_loop, daemon=True, name="jobs-retention")
+    t.start()
 
 
 def check_config() -> None:
@@ -383,6 +759,19 @@ def check_config() -> None:
         _redis.ping()
     except Exception as e:
         raise SystemExit(f"[fatal] cannot reach Redis at {REDIS_URL}: {e}")
+    # AMQP — ping upfront so failure is adjacent to the other config checks
+    # instead of surfacing later in main() after "redis OK" is logged.
+    try:
+        _amqp_probe = pika.BlockingConnection(pika.ConnectionParameters(
+            host=AMQP_HOST, port=AMQP_PORT, virtual_host=AMQP_VHOST,
+            credentials=pika.PlainCredentials(AMQP_USER, AMQP_PASS),
+            socket_timeout=3, blocked_connection_timeout=3,
+        ))
+        _amqp_probe.close()
+    except Exception as e:
+        raise SystemExit(
+            f"[fatal] cannot reach AMQP at {AMQP_HOST}:{AMQP_PORT}{AMQP_VHOST}: {e}"
+        )
     # File service (HEAD /healthz; fall back to GET). Soft-fail if unreachable,
     # since smoke.sh asserts upload path separately; here we only warn.
     try:
@@ -402,6 +791,24 @@ def check_config() -> None:
 
 def main() -> None:
     check_config()
+
+    # Sweep on startup (in case the worker was down for long enough that the
+    # retention window closed on in-flight jobs) then schedule hourly sweeps.
+    removed = _sweep_job_dirs()
+    if removed:
+        log("retention sweep (startup)", removed=removed,
+            hours=JOBS_RETENTION_HOURS)
+    _start_retention_thread()
+
+    # Prometheus exporter on :9109 (default). Scraped by the local prometheus
+    # install. Skipped when DPSIM_PROMETHEUS_PORT=0 or the client lib missing.
+    if _PROMETHEUS_AVAILABLE and PROMETHEUS_PORT > 0:
+        try:
+            _prom_start_http_server(PROMETHEUS_PORT)
+            log("prometheus exporter up", port=PROMETHEUS_PORT)
+        except OSError as e:
+            log("prometheus exporter failed to bind — continuing without metrics",
+                level="warning", port=PROMETHEUS_PORT, error=str(e)[:120])
 
     creds = pika.PlainCredentials(AMQP_USER, AMQP_PASS)
     params = pika.ConnectionParameters(

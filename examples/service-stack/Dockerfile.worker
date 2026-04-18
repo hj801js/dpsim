@@ -1,15 +1,26 @@
 # Runtime image for the DPsim AMQP worker.
 # The compiled dpsimpy is mounted in at /opt/dpsim/dpsimpy.so by the
 # compose file rather than rebuilt here, so this image stays tiny.
+#
+# Python deps match the ones worker.py imports as of session 16:
+#   pika    → AMQP
+#   redis   → status/progress sidechannel
+#   requests→ file-service HTTP
+#   prometheus_client → :9109 metrics exporter
+#   boto3   → MinIO uploads (optional via MINIO_ENDPOINT)
 
 FROM python:3.11-slim
 
-RUN pip install --no-cache-dir pika redis requests
+RUN pip install --no-cache-dir \
+        pika redis requests \
+        prometheus_client boto3
 
 WORKDIR /opt/dpsim
 ENV PYTHONPATH=/opt/dpsim
 
 COPY worker.py /opt/dpsim/worker.py
+
+EXPOSE 9109
 
 # The dpsimpy .so must be bind-mounted to /opt/dpsim/dpsimpy.so at runtime.
 # For Python to import it via `import dpsimpy` the file must be named so

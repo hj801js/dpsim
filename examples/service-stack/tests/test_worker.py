@@ -89,6 +89,30 @@ class TestFindCimBundle:
         })
         assert token is None
 
+    def test_substring_does_not_match(self, monkeypatch):
+        """A model_id that contains a known token as substring must not
+        route there. Regression for C4 (docs/22)."""
+        monkeypatch.setitem(worker.CIM_BUNDLES, "wscc9", ["/fake/WSCC_A.xml"])
+        token, _ = worker._find_cim_bundle({
+            "model": {"url": ["https://example.com/models/wscc9-broken"]},
+        })
+        assert token is None
+
+    def test_uploaded_model_reads_cache(self, monkeypatch, tmp_path):
+        """If CIM_BUNDLES has no match, `_find_cim_bundle` should return
+        files from the uploaded model cache when present. Pre-populate the
+        cache so the function never needs to hit file-service."""
+        monkeypatch.setattr(worker, "MODELS_CACHE_DIR", tmp_path)
+        cache = tmp_path / "abc123"
+        cache.mkdir()
+        (cache / "EQ.xml").write_text("<cim/>")
+        (cache / "TP.xml").write_text("<cim/>")
+        token, files = worker._find_cim_bundle({
+            "model": {"url": ["http://fs/api/files/abc123"]},
+        })
+        assert token == "abc123"
+        assert sorted(Path(f).name for f in files) == ["EQ.xml", "TP.xml"]
+
 
 # ---------------------------------------------------------------------------
 # set_status — writes redis sidechannel key with warnings when supplied
@@ -122,6 +146,57 @@ class TestSetStatus:
         payload = json.loads(captured["value"])
         assert "warnings" not in payload
         assert "error" not in payload
+        assert "progress" not in payload
+
+    def test_set_status_includes_progress_when_given(self, monkeypatch):
+        captured = {}
+
+        class FakeRedis:
+            def set(self, key, value):
+                captured["value"] = value
+
+        monkeypatch.setattr(worker, "_redis", FakeRedis())
+        worker.set_status("abc", "done", progress=100.0)
+        payload = json.loads(captured["value"])
+        assert payload["progress"] == 100.0
+
+    def test_set_status_clamps_progress(self, monkeypatch):
+        captured = {}
+
+        class FakeRedis:
+            def set(self, key, value):
+                captured["value"] = value
+
+        monkeypatch.setattr(worker, "_redis", FakeRedis())
+        worker.set_status("abc", "running", progress=150.0)
+        assert json.loads(captured["value"])["progress"] == 100.0
+        worker.set_status("abc", "running", progress=-5.0)
+        assert json.loads(captured["value"])["progress"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# set_progress — preserves status/error/warnings, only touches `progress`
+# ---------------------------------------------------------------------------
+class TestSetProgress:
+    def test_set_progress_preserves_warnings(self, monkeypatch):
+        state = {"value": json.dumps({
+            "status": "running",
+            "warnings": ["timestep clamped"],
+        })}
+
+        class FakeRedis:
+            def get(self, key):
+                return state["value"]
+
+            def set(self, key, value):
+                state["value"] = value
+
+        monkeypatch.setattr(worker, "_redis", FakeRedis())
+        worker.set_progress("abc", 42.5)
+        payload = json.loads(state["value"])
+        assert payload["warnings"] == ["timestep clamped"]
+        assert payload["status"] == "running"
+        assert payload["progress"] == 42.5
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +204,38 @@ class TestSetStatus:
 # A regression here (reintroducing an LRU) would break the WSCC-9
 # same-job×2 smoke test; this pytest keeps the intent visible in code.
 # ---------------------------------------------------------------------------
+def test_sweep_job_dirs_respects_retention(monkeypatch, tmp_path):
+    """P2.6 retention — dirs older than JOBS_RETENTION_HOURS go, newer stay."""
+    import os, time
+    old = tmp_path / "stale_job"
+    new = tmp_path / "fresh_job"
+    old.mkdir()
+    new.mkdir()
+    # Backdate the old dir by 48h.
+    past = time.time() - 48 * 3600
+    os.utime(old, (past, past))
+
+    monkeypatch.setattr(worker, "JOBS_DIR", tmp_path)
+    monkeypatch.setattr(worker, "JOBS_RETENTION_HOURS", 24.0)
+    removed = worker._sweep_job_dirs()
+    assert removed == 1
+    assert not old.exists()
+    assert new.exists()
+
+
+def test_sweep_disabled_by_zero_retention(monkeypatch, tmp_path):
+    """JOBS_RETENTION_HOURS=0 opts out of purging entirely."""
+    import os, time
+    (tmp_path / "ancient").mkdir()
+    past = time.time() - 365 * 24 * 3600
+    os.utime(tmp_path / "ancient", (past, past))
+
+    monkeypatch.setattr(worker, "JOBS_DIR", tmp_path)
+    monkeypatch.setattr(worker, "JOBS_RETENTION_HOURS", 0.0)
+    assert worker._sweep_job_dirs() == 0
+    assert (tmp_path / "ancient").exists()
+
+
 def test_build_cim_topology_always_returns_fresh_object(monkeypatch):
     """Two consecutive calls must produce distinct objects.
 

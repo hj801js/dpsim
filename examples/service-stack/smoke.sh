@@ -23,7 +23,7 @@ ok "file-service up"
 RESP=$(curl -sf -X POST "$API/simulation" \
   -H 'Content-Type: application/json' \
   -d '{"simulation_type":"Powerflow","model_id":"demo","load_profile_id":"None",
-       "domain":"DP","solver":"MNA","timestep":1,"finaltime":2}')
+       "domain":"DP","solver":"MNA","timestep":1,"finaltime":20}')
 SID=$(echo "$RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["simulation_id"])')
 ok "POST demo -> simulation_id=$SID"
 
@@ -42,7 +42,7 @@ done
 RESP=$(curl -sf -X POST "$API/simulation" \
   -H 'Content-Type: application/json' \
   -d '{"simulation_type":"Powerflow","model_id":"wscc9","load_profile_id":"None",
-       "domain":"DP","solver":"MNA","timestep":1,"finaltime":2}')
+       "domain":"DP","solver":"MNA","timestep":1,"finaltime":20}')
 SID=$(echo "$RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["simulation_id"])')
 ok "POST wscc9 -> simulation_id=$SID"
 
@@ -163,5 +163,132 @@ PYEOF
 }
 
 dlq_regression
+
+# 7. server-side input validation — posting timestep=0 must return a 400,
+# posting finaltime < 10*timestep must return a 400. Regression guard for
+# M13 (docs/22) so these never silently reach the queue again.
+validate_reject() {
+    local label=$1 body=$2
+    local CODE
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/simulation" \
+      -H 'Content-Type: application/json' -d "$body")
+    [[ "$CODE" == "400" ]] \
+      && ok "server validation: $label rejected (HTTP $CODE)" \
+      || fail "server validation: $label should have been 400, got $CODE"
+}
+
+validate_reject "timestep=0" \
+  '{"simulation_type":"Powerflow","model_id":"demo","load_profile_id":"None","domain":"DP","solver":"MNA","timestep":0,"finaltime":100}'
+validate_reject "finaltime<10*timestep" \
+  '{"simulation_type":"Powerflow","model_id":"demo","load_profile_id":"None","domain":"DP","solver":"MNA","timestep":5,"finaltime":20}'
+
+# 8. liveness probe — /healthz should return 200 "ok" (H10 regression).
+HZ=$(curl -sf "$API/healthz") || fail "GET /healthz failed"
+[[ "$HZ" == "ok" ]] && ok "/healthz returned 'ok'" || fail "/healthz returned '$HZ' (expected 'ok')"
+
+# 9. version probe — /version returns name + version + git_sha (L3 regression).
+VER=$(curl -sf "$API/version") || fail "GET /version failed"
+echo "$VER" | python3 -c 'import sys,json; d=json.load(sys.stdin); assert d["name"]=="dpsim-api" and "version" in d and "git_sha" in d, d' \
+  && ok "/version returned $VER" || fail "/version missing fields: $VER"
+
+# 9b. model upload — POST /models returns a model_id; oversize request 413.
+MODEL_BODY='<cim>test</cim>'
+MID=$(curl -sf -X POST "$API/models" -H 'Content-Type: application/xml' --data "$MODEL_BODY" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["model_id"])')
+[[ -n "$MID" ]] && ok "/models returned model_id=$MID" || fail "/models didn't return a model_id"
+OVERSIZE=$(dd if=/dev/zero bs=1M count=20 2>/dev/null | base64)
+HTTP_CODE=$(printf "%s" "$OVERSIZE" | curl -s -o /dev/null -w '%{http_code}' -X POST "$API/models" \
+  -H 'Content-Type: application/octet-stream' --data-binary @-)
+[[ "$HTTP_CODE" == "413" ]] && ok "/models rejected 20 MiB payload (HTTP $HTTP_CODE)" \
+  || fail "/models oversize expected 413, got $HTTP_CODE"
+
+# 9c. dynamic CIM loading — upload a zipped WSCC-9 bundle and verify the worker
+# materializes the cache + runs CIMReader on it (topology_source = cim:<id>).
+WSCC9_DIR=$(python3 -c '
+import os, sys, glob
+for root in ["/Users/hk/DPsim_hk/dpsim/build/_deps/cim-data-src/WSCC-09/WSCC-09",
+             os.path.expanduser("~/DPsim_hk/dpsim/build/_deps/cim-data-src/WSCC-09/WSCC-09")]:
+    if glob.glob(os.path.join(root, "*.xml")): print(root); sys.exit(0)
+')
+if [[ -n "$WSCC9_DIR" ]]; then
+    ZIP=/tmp/dpsim_smoke_wscc9_$$.zip
+    rm -f "$ZIP"
+    ( cd "$WSCC9_DIR" && /usr/bin/zip -qj "$ZIP" *.xml )
+    UP_MID=$(curl -sf -X POST "$API/models" -H 'Content-Type: application/zip' \
+      --data-binary @"$ZIP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["model_id"])')
+    UP_SID=$(curl -sf -X POST "$API/simulation" -H 'Content-Type: application/json' \
+      -d "{\"simulation_type\":\"Powerflow\",\"model_id\":\"$UP_MID\",\"load_profile_id\":\"None\",\"domain\":\"DP\",\"solver\":\"MNA\",\"timestep\":1,\"finaltime\":50}" \
+      | python3 -c 'import sys,json; print(json.load(sys.stdin)["simulation_id"])')
+    for i in $(seq 1 15); do
+        JOB_DIR=$(ls -dt /tmp/dpsim_jobs/*/ 2>/dev/null | head -1)
+        STATUS_FILE="${JOB_DIR}status.json"
+        if [[ -f "$STATUS_FILE" ]]; then
+            SRC=$(python3 -c "import json; print(json.load(open('$STATUS_FILE')).get('topology_source',''))")
+            if [[ "$SRC" == "cim:$UP_MID" ]]; then
+                ok "uploaded WSCC-9 bundle executed with topology_source=$SRC"
+                rm -f "$ZIP"
+                break
+            fi
+        fi
+        sleep 1
+        [[ $i -eq 15 ]] && fail "uploaded CIM never produced topology_source=cim:$UP_MID"
+    done
+else
+    echo "[skip] WSCC-9 build-deps not present; upload-run step skipped"
+fi
+
+# 9d. trace-id propagation — POST /simulation returns a trace_id, worker stamps
+# it into the redis status sidechannel. Regression for P2.2 (docs/30).
+TR=$(curl -sf -X POST "$API/simulation" -H 'Content-Type: application/json' \
+  -d '{"simulation_type":"Powerflow","model_id":"demo","load_profile_id":"None","domain":"DP","solver":"MNA","timestep":1,"finaltime":20}')
+TR_SID=$(echo "$TR" | python3 -c 'import sys,json; print(json.load(sys.stdin)["simulation_id"])')
+TR_TID=$(echo "$TR" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("trace_id",""))')
+[[ -n "$TR_TID" && ${#TR_TID} -ge 8 ]] \
+  && ok "/simulation response carries trace_id=$TR_TID" \
+  || fail "/simulation response missing trace_id: $TR"
+for i in $(seq 1 20); do
+    REDIS_TID=$(python3 - <<PYEOF
+import redis, json, sys
+r = redis.from_url("redis://localhost:6379/0")
+v = r.get(f"dpsim:sim:$TR_SID:status")
+if v:
+    d = json.loads(v)
+    if d.get("trace_id") and d.get("status") in ("done", "running"):
+        print(d["trace_id"]); sys.exit(0)
+PYEOF
+)
+    if [[ "$REDIS_TID" == "$TR_TID" ]]; then
+        ok "redis status carries same trace_id=$TR_TID (sid=$TR_SID)"
+        break
+    fi
+    sleep 0.5
+    [[ $i -eq 20 ]] && fail "redis trace_id never matched $TR_TID (got '$REDIS_TID')"
+done
+
+# 10. H12 progress sidechannel — after any completed job redis must carry
+# progress==100 under the integer simulation_id key. Catches regressions in
+# the dpsim-api AMQP payload (worker keys by simulation_id sent from Rust).
+SID=$(curl -sf -X POST "$API/simulation" \
+  -H 'Content-Type: application/json' \
+  -d '{"simulation_type":"Powerflow","model_id":"wscc9","load_profile_id":"None","domain":"DP","solver":"MNA","timestep":1,"finaltime":20}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["simulation_id"])')
+for i in $(seq 1 20); do
+    PROG=$(python3 - <<PYEOF
+import redis, json, sys
+r = redis.from_url("redis://localhost:6379/0")
+v = r.get(f"dpsim:sim:$SID:status")
+if not v: sys.exit(0)
+d = json.loads(v)
+if d.get("status") == "done":
+    print(d.get("progress", -1))
+PYEOF
+)
+    if [[ "$PROG" == "100.0" ]]; then
+        ok "progress sidechannel reached 100.0 for sid=$SID"
+        break
+    fi
+    sleep 0.5
+    [[ $i -eq 20 ]] && fail "progress never reached 100.0 for sid=$SID"
+done
 
 ok "smoke test passed"
