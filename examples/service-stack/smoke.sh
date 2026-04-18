@@ -265,6 +265,25 @@ PYEOF
     [[ $i -eq 20 ]] && fail "redis trace_id never matched $TR_TID (got '$REDIS_TID')"
 done
 
+# 9e. P3.4 outage — submit WSCC-9 with outage_component=LINE75, expect the
+# worker's status.json to report topology_source containing "outage:LINE75".
+OUT_SID=$(curl -sf -X POST "$API/simulation" -H 'Content-Type: application/json' \
+  -d '{"simulation_type":"Powerflow","model_id":"wscc9","load_profile_id":"None","domain":"DP","solver":"MNA","timestep":1,"finaltime":50,"outage_component":"LINE75"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["simulation_id"])')
+for i in $(seq 1 20); do
+    JOB_DIR=$(ls -dt /tmp/dpsim_jobs/*/ 2>/dev/null | head -1)
+    STATUS_FILE="${JOB_DIR}status.json"
+    if [[ -f "$STATUS_FILE" ]]; then
+        SRC=$(python3 -c "import json; print(json.load(open('$STATUS_FILE')).get('topology_source',''))")
+        if [[ "$SRC" == *"outage:LINE75"* ]]; then
+            ok "outage applied (topology_source=$SRC, sid=$OUT_SID)"
+            break
+        fi
+    fi
+    sleep 0.5
+    [[ $i -eq 20 ]] && fail "outage never surfaced in topology_source for sid=$OUT_SID"
+done
+
 # 10. H12 progress sidechannel — after any completed job redis must carry
 # progress==100 under the integer simulation_id key. Catches regressions in
 # the dpsim-api AMQP payload (worker keys by simulation_id sent from Rust).

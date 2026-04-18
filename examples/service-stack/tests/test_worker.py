@@ -204,6 +204,53 @@ class TestSetProgress:
 # A regression here (reintroducing an LRU) would break the WSCC-9
 # same-job×2 smoke test; this pytest keeps the intent visible in code.
 # ---------------------------------------------------------------------------
+def test_apply_outage_bumps_target_rx(monkeypatch, tmp_path):
+    """P3.4 — _apply_outage multiplies r and x by 1000 for the named
+    ACLineSegment, leaves the rest untouched, and reports 'applied'."""
+    src = tmp_path / "WSCC-09_EQ.xml"
+    src.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" '
+        '         xmlns:cim="http://iec.ch/TC57/2012/CIM-schema-cim16#">'
+        '<cim:ACLineSegment rdf:ID="LINE75">'
+        '<cim:IdentifiedObject.name>LINE75</cim:IdentifiedObject.name>'
+        '<cim:ACLineSegment.r>10.0</cim:ACLineSegment.r>'
+        '<cim:ACLineSegment.x>50.0</cim:ACLineSegment.x>'
+        '</cim:ACLineSegment>'
+        '<cim:ACLineSegment rdf:ID="LINE96">'
+        '<cim:IdentifiedObject.name>LINE96</cim:IdentifiedObject.name>'
+        '<cim:ACLineSegment.r>20.0</cim:ACLineSegment.r>'
+        '<cim:ACLineSegment.x>60.0</cim:ACLineSegment.x>'
+        '</cim:ACLineSegment>'
+        '</rdf:RDF>'
+    )
+    monkeypatch.setattr(worker, "JOBS_DIR", tmp_path)
+    new_files, status = worker._apply_outage([str(src)], "LINE75", "job-x")
+    assert status == "applied"
+    assert len(new_files) == 1 and Path(new_files[0]).name == "WSCC-09_EQ.xml"
+    content = Path(new_files[0]).read_text()
+    assert "10000.0" in content, "LINE75 r should be 10.0 * 1000"
+    assert "50000.0" in content, "LINE75 x should be 50.0 * 1000"
+    # LINE96 values preserved (not 20000/60000).
+    assert ">20.0<" in content and ">60.0<" in content
+
+
+def test_apply_outage_not_found(monkeypatch, tmp_path):
+    """Outage component not present → status 'not-found', unchanged copy."""
+    src = tmp_path / "EQ.xml"
+    src.write_text(
+        '<?xml version="1.0"?>'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" '
+        '         xmlns:cim="http://iec.ch/TC57/2012/CIM-schema-cim16#">'
+        '<cim:ACLineSegment rdf:ID="X"><cim:IdentifiedObject.name>X</cim:IdentifiedObject.name>'
+        '<cim:ACLineSegment.r>1</cim:ACLineSegment.r></cim:ACLineSegment>'
+        '</rdf:RDF>'
+    )
+    monkeypatch.setattr(worker, "JOBS_DIR", tmp_path)
+    _, status = worker._apply_outage([str(src)], "DOES_NOT_EXIST", "job-y")
+    assert status == "not-found"
+
+
 def test_sweep_job_dirs_respects_retention(monkeypatch, tmp_path):
     """P2.6 retention — dirs older than JOBS_RETENTION_HOURS go, newer stay."""
     import os, time

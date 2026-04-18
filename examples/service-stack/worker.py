@@ -425,6 +425,80 @@ def _find_cim_bundle(payload: dict[str, Any]) -> tuple[str | None, list[str]]:
     return None, []
 
 
+def _apply_outage(files: list[str], component_name: str, sim_id: str) -> tuple[list[str], str]:
+    """P3.4 — copy the CIM bundle to a per-job dir and bump r/x of the target
+    ACLineSegment by 1000× so the solver treats it as effectively open.
+
+    Returns (new_files, status) where status is one of:
+      * "applied"   — match found and mutated
+      * "not-found" — bundle copied but no ACLineSegment named <component_name>
+      * "skipped"   — something went wrong; original files returned unchanged
+
+    Using a 1000× bump instead of rip-out-the-element because the latter
+    would also require removing dangling Terminals and may desync
+    TopologicalIsland references in the TP/SV files. r/x bump keeps the
+    topology graph intact while making the line carry ~0 current.
+    """
+    import shutil
+    import xml.etree.ElementTree as ET
+
+    # Register namespaces globally so ET.write emits rdf:RDF + cim:* prefixes
+    # exactly as CIMpp expects. Without this the root element comes out as
+    # the "default" namespace (ns0:RDF) and the CIM parser aborts with
+    # "Nobody knows the cim:RDF I've seen".
+    ET.register_namespace("rdf",    "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+    ET.register_namespace("cim",    "http://iec.ch/TC57/2012/CIM-schema-cim16#")
+    ET.register_namespace("md",     "http://iec.ch/TC57/61970-552/ModelDescription/1#")
+    ET.register_namespace("entsoe", "http://entsoe.eu/Secretariat/ProfileExtension/2#")
+
+    # Some bundles use a different CIM version; accept any "CIM-schema-cim" NS.
+    def is_cim_ns(tag: str) -> bool:
+        return tag.startswith("{http://iec.ch/TC57/") and "CIM-schema" in tag
+
+    out_dir = JOBS_DIR / sim_id / "cim-outage"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        new_files: list[str] = []
+        for src in files:
+            dst = out_dir / Path(src).name
+            shutil.copyfile(src, dst)
+            new_files.append(str(dst))
+    except Exception:
+        return files, "skipped"
+
+    applied = False
+    for path in new_files:
+        try:
+            tree = ET.parse(path)
+            root = tree.getroot()
+        except Exception:
+            continue
+        changed = False
+        for seg in list(root):
+            if not is_cim_ns(seg.tag) or not seg.tag.endswith("ACLineSegment"):
+                continue
+            name_el = None
+            for child in seg:
+                if child.tag.endswith("IdentifiedObject.name"):
+                    name_el = child
+                    break
+            if name_el is None or (name_el.text or "").strip() != component_name:
+                continue
+            # Found the target. Bump r/x.
+            for child in seg:
+                if child.tag.endswith("ACLineSegment.r") or child.tag.endswith("ACLineSegment.x"):
+                    try:
+                        child.text = str(float(child.text) * 1000.0)
+                        changed = True
+                    except Exception:
+                        pass
+        if changed:
+            tree.write(path, encoding="utf-8", xml_declaration=True)
+            applied = True
+
+    return new_files, ("applied" if applied else "not-found")
+
+
 def _build_demo_topology():
     gnd = dpsimpy.dp.SimNode.gnd
     n1 = dpsimpy.dp.SimNode("n1")
@@ -508,8 +582,19 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
     logger_cim = dpsimpy.Logger(sim_name)
 
     token, cim_files = _find_cim_bundle(payload)
+    # P3.4 — apply outage mutation before CIMReader parses the files.
+    outage_target = params.get("outage_component")
+    outage_status = None
+    if cim_files and outage_target:
+        cim_files, outage_status = _apply_outage(cim_files, outage_target, str(sim_id))
+        if outage_status == "applied":
+            warnings.append(f"outage applied: ACLineSegment '{outage_target}' r/x ×1000")
+        elif outage_status == "not-found":
+            warnings.append(f"outage target '{outage_target}' not found in CIM; running baseline")
+        else:
+            warnings.append(f"outage mutation skipped (io error); running baseline")
     if cim_files:
-        source = f"cim:{token}"
+        source = f"cim:{token}" + (f"+outage:{outage_target}" if outage_status == "applied" else "")
         # NOTE: sys is single-use. Each job rebuilds from CIM XML (docs/20).
         sys = build_cim_topology(sim_name, cim_files, actual_domain, freq=60)
         for i, node in enumerate(sys.nodes):
