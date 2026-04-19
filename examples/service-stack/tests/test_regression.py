@@ -22,6 +22,13 @@ API = "http://localhost:8000"
 # Lock both systems we trust today. Adding a new system = drop a
 # <name>_reference.json next to this file and add the name below.
 REFERENCE_CASES = ["wscc9", "ieee39", "cigre_mv"]
+# IEEE-14, Matpower case9/case14/case300 are registered in worker
+# CIM_BUNDLES but produce unusable DP output on the shipped cim-data-src
+# exports: IEEE-14 → NaN on v_n12 after one step; Matpower cases → every
+# bus voltage stays 0.0 (CIMReader doesn't wire the profile correctly).
+# Kept in the UI so a future session investigating upstream dpsim/CIMpp
+# has the models to reproduce; regression stays on the three that work.
+# See docs/46 §2/§6 and docs/47 §B.
 # IEEE-14 is registered in worker.CIM_BUNDLES and exposed in the UI, but
 # the shipped cim-data-src EQ+TP+SV set produces numerical divergence in
 # CIMReader+DP after the first step (NaN on one bus). Kept out of the
