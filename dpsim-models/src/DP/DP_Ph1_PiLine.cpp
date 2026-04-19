@@ -49,15 +49,35 @@ void DP::Ph1::PiLine::initializeFromNodesAndTerminals(Real frequency) {
                      MNA_SUBCOMP_TASK_ORDER::TASK_BEFORE_PARENT,
                      MNA_SUBCOMP_TASK_ORDER::TASK_BEFORE_PARENT, false);
 
-  mSubSeriesInductor =
-      std::make_shared<DP::Ph1::Inductor>(**mName + "_ind", mLogLevel);
-  mSubSeriesInductor->setParameters(**mSeriesInd);
-  mSubSeriesInductor->connect({mVirtualNodes[0], mTerminals[1]->node()});
-  mSubSeriesInductor->initialize(mFrequencies);
-  mSubSeriesInductor->initializeFromNodesAndTerminals(frequency);
-  addMNASubComponent(mSubSeriesInductor,
-                     MNA_SUBCOMP_TASK_ORDER::TASK_BEFORE_PARENT,
-                     MNA_SUBCOMP_TASK_ORDER::TASK_BEFORE_PARENT, true);
+  if (**mSeriesInd >= 0) {
+    // Series inductor (standard case: X > 0 transmission line).
+    mSubSeriesInductor =
+        std::make_shared<DP::Ph1::Inductor>(**mName + "_ind", mLogLevel);
+    mSubSeriesInductor->setParameters(**mSeriesInd);
+    mSubSeriesInductor->connect({mVirtualNodes[0], mTerminals[1]->node()});
+    mSubSeriesInductor->initialize(mFrequencies);
+    mSubSeriesInductor->initializeFromNodesAndTerminals(frequency);
+    addMNASubComponent(mSubSeriesInductor,
+                       MNA_SUBCOMP_TASK_ORDER::TASK_BEFORE_PARENT,
+                       MNA_SUBCOMP_TASK_ORDER::TASK_BEFORE_PARENT, true);
+  } else {
+    // Series compensation (X < 0): stamp as a capacitor.
+    // X = omega * L (negative L from Reader); equivalent series capacitor
+    // satisfies X = -1/(omega * C), so C = -1 / (omega^2 * L).
+    Real seriesCap = -1.0 / (omega * omega * **mSeriesInd);
+    mSubSeriesCapacitor =
+        std::make_shared<DP::Ph1::Capacitor>(**mName + "_cap_series", mLogLevel);
+    mSubSeriesCapacitor->setParameters(seriesCap);
+    mSubSeriesCapacitor->connect({mVirtualNodes[0], mTerminals[1]->node()});
+    mSubSeriesCapacitor->initialize(mFrequencies);
+    mSubSeriesCapacitor->initializeFromNodesAndTerminals(frequency);
+    addMNASubComponent(mSubSeriesCapacitor,
+                       MNA_SUBCOMP_TASK_ORDER::TASK_BEFORE_PARENT,
+                       MNA_SUBCOMP_TASK_ORDER::TASK_BEFORE_PARENT, true);
+    SPDLOG_LOGGER_INFO(mSLog,
+                       "Series compensation: L={} H < 0, using capacitor C={} F",
+                       (float)**mSeriesInd, (float)seriesCap);
+  }
 
   // By default there is always a small conductance to ground to
   // avoid problems with floating nodes.
@@ -173,7 +193,13 @@ void DP::Ph1::PiLine::mnaCompUpdateVoltage(const Matrix &leftVector) {
 }
 
 void DP::Ph1::PiLine::mnaCompUpdateCurrent(const Matrix &leftVector) {
-  (**mIntfCurrent)(0, 0) = mSubSeriesInductor->intfCurrent()(0, 0);
+  // When mSeriesInd >= 0 the series branch is inductive; otherwise it was
+  // realised as a capacitor (series compensation). Read the current from
+  // whichever submodel is active.
+  if (mSubSeriesInductor)
+    (**mIntfCurrent)(0, 0) = mSubSeriesInductor->intfCurrent()(0, 0);
+  else if (mSubSeriesCapacitor)
+    (**mIntfCurrent)(0, 0) = mSubSeriesCapacitor->intfCurrent()(0, 0);
 }
 
 // #### Tear Methods ####
@@ -194,21 +220,34 @@ MNAInterface::List DP::Ph1::PiLine::mnaTearGroundComponents() {
 void DP::Ph1::PiLine::mnaTearInitialize(Real omega, Real timeStep) {
   mSubSeriesResistor->mnaTearSetIdx(mTearIdx);
   mSubSeriesResistor->mnaTearInitialize(omega, timeStep);
-  mSubSeriesInductor->mnaTearSetIdx(mTearIdx);
-  mSubSeriesInductor->mnaTearInitialize(omega, timeStep);
+  if (mSubSeriesInductor) {
+    mSubSeriesInductor->mnaTearSetIdx(mTearIdx);
+    mSubSeriesInductor->mnaTearInitialize(omega, timeStep);
+  }
+  // DP::Ph1::Capacitor does not implement MNATearInterface; series-cap
+  // lines therefore opt out of the tearing optimisation. The simulation
+  // still runs correctly via the normal MNA path.
 }
 
 void DP::Ph1::PiLine::mnaTearApplyMatrixStamp(SparseMatrixRow &tearMatrix) {
   mSubSeriesResistor->mnaTearApplyMatrixStamp(tearMatrix);
-  mSubSeriesInductor->mnaTearApplyMatrixStamp(tearMatrix);
+  if (mSubSeriesInductor)
+    mSubSeriesInductor->mnaTearApplyMatrixStamp(tearMatrix);
 }
 
 void DP::Ph1::PiLine::mnaTearApplyVoltageStamp(Matrix &voltageVector) {
-  mSubSeriesInductor->mnaTearApplyVoltageStamp(voltageVector);
+  if (mSubSeriesInductor)
+    mSubSeriesInductor->mnaTearApplyVoltageStamp(voltageVector);
 }
 
 void DP::Ph1::PiLine::mnaTearPostStep(Complex voltage, Complex current) {
-  mSubSeriesInductor->mnaTearPostStep(voltage - current * **mSeriesRes,
-                                      current);
-  (**mIntfCurrent)(0, 0) = mSubSeriesInductor->intfCurrent()(0, 0);
+  if (mSubSeriesInductor) {
+    mSubSeriesInductor->mnaTearPostStep(voltage - current * **mSeriesRes,
+                                        current);
+    (**mIntfCurrent)(0, 0) = mSubSeriesInductor->intfCurrent()(0, 0);
+  } else if (mSubSeriesCapacitor) {
+    // No tearing-based post-step available; fall back to reading capacitor
+    // current directly.
+    (**mIntfCurrent)(0, 0) = mSubSeriesCapacitor->intfCurrent()(0, 0);
+  }
 }

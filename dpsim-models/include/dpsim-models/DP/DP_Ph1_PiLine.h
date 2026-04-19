@@ -24,8 +24,11 @@ class PiLine : public CompositePowerComp<Complex>,
                public Base::Ph1::PiLine,
                public SharedFactory<PiLine> {
 protected:
-  /// Series Inductance submodel
+  /// Series Inductance submodel (used when mSeriesInd >= 0)
   std::shared_ptr<Inductor> mSubSeriesInductor;
+  /// Series Capacitor submodel (used when mSeriesInd < 0 — series
+  /// compensation. C = -1 / (omega^2 * mSeriesInd))
+  std::shared_ptr<Capacitor> mSubSeriesCapacitor;
   /// Series Resistor submodel
   std::shared_ptr<Resistor> mSubSeriesResistor;
   /// Parallel Resistor submodel at Terminal 0
