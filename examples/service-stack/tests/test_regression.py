@@ -21,7 +21,11 @@ API = "http://localhost:8000"
 
 # Lock both systems we trust today. Adding a new system = drop a
 # <name>_reference.json next to this file and add the name below.
-REFERENCE_CASES = ["wscc9", "ieee39"]
+REFERENCE_CASES = ["wscc9", "ieee39", "cigre_mv"]
+# IEEE-14 is registered in worker.CIM_BUNDLES and exposed in the UI, but
+# the shipped cim-data-src EQ+TP+SV set produces numerical divergence in
+# CIMReader+DP after the first step (NaN on one bus). Kept out of the
+# regression until upstream dpsim/CIMpp is patched. See docs/46.
 
 
 def _post(path: str, body: dict) -> dict:

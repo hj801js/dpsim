@@ -125,8 +125,18 @@ DOMAIN_MAP = {
 # Known CIM bundles, keyed by the file-service model_id (tail of the model
 # URL, with any extension stripped). Extend this dict to accept more models.
 CIM_BUNDLES = {
-    "wscc9": sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/WSCC-09/WSCC-09/*.xml"))),
-    "ieee39": sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/IEEE-39/*.xml"))),
+    "wscc9":    sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/WSCC-09/WSCC-09/*.xml"))),
+    "ieee14":   sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/IEEE-14/*.xml"))),
+    "ieee39":   sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/IEEE-39/*.xml"))),
+    "cigre_mv": sorted(glob.glob(str(
+        DPSIM_BUILD / "_deps/cim-data-src/CIGRE_MV/NEPLAN/"
+                      "CIGRE_MV_no_tapchanger_noLoad1_LeftFeeder_With_LoadFlow_Results/*.xml"
+    ))),
+    # Matpower single-file cases. Each XML bundles EQ+TP in one, which is
+    # exactly what CIMReader prefers when there's no multi-file profile.
+    "matpower_case9":   sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/Matpower_cases/case9.xml"))),
+    "matpower_case14":  sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/Matpower_cases/case14.xml"))),
+    "matpower_case300": sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/Matpower_cases/case300.xml"))),
 }
 
 MAX_FINAL_TIME_SEC = 30.0
