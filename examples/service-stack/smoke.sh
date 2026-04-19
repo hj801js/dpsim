@@ -11,6 +11,14 @@ set -euo pipefail
 
 API=${API:-http://localhost:8000}
 FSS=${FSS:-http://127.0.0.1:18080}
+PYTHON_BIN=${PYTHON_BIN:-python}
+
+# On some macOS + conda setups, `conda activate` updates `python` but leaves
+# `python3` pointing at the system interpreter. Shadow `python3` locally so
+# every inline helper below uses the environment-selected Python consistently.
+python3() {
+  command "$PYTHON_BIN" "$@"
+}
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "[OK] $*"; }
