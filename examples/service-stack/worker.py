@@ -348,6 +348,21 @@ def get_status(sim_id: str | int) -> dict[str, Any] | None:
     return json.loads(raw) if raw else None
 
 
+def set_bus_map(sim_id: str | int, names: list[str]) -> None:
+    """Write the solver-determined bus-name ordering for this sim under
+    a separate sidechannel key. The UI joins worker CSV columns
+    (`v_n0.re`, `v_n0.im`, …) with catalog bus names via names[0..N-1].
+
+    Kept under its own key (not merged into :status) so progress updates
+    don't clobber it — names are static for the life of the sim. JSON
+    array of strings; empty list on error is fine (UI falls back to
+    topology-only overlay)."""
+    try:
+        _redis.set(f"dpsim:sim:{sim_id}:bus_map", json.dumps(names))
+    except Exception as exc:
+        logger.debug("set_bus_map failed sim=%s: %s", sim_id, exc)
+
+
 class _ProgressWatcher:
     """Sample the CSV output file while dpsim runs and publish an approximate
     progress percentage to redis. Approximate because dpsimpy doesn't expose a
@@ -889,8 +904,15 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
         source = f"cim:{token}{suffix}"
         # NOTE: sys is single-use. Each job rebuilds from CIM XML (docs/20).
         sys = build_cim_topology(sim_name, cim_files, actual_domain, freq=60)
+        bus_names: list[str] = []
         for i, node in enumerate(sys.nodes):
             logger_cim.log_attribute(f"v_n{i}", "v", node)
+            # dpsim nodes expose .name via the Attribute interface; some
+            # builds return pybind-wrapped str, others a plain str. Coerce
+            # either way so we always store a list[str].
+            raw = getattr(node, "name", None)
+            bus_names.append(str(raw()) if callable(raw) else str(raw or f"v_n{i}"))
+        set_bus_map(sim_id, bus_names)
     else:
         # Programmatic demo topology — EMT here actually runs EMT (P3.1).
         source = f"demo-circuit:{dom_name.lower()}"
