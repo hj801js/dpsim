@@ -122,6 +122,23 @@ DOMAIN_MAP = {
     "EMT": dpsimpy.Domain.EMT,
 }
 
+# Solver types. SP domain pairs with NRP (Newton-Raphson Powerflow) —
+# using MNA with SP silently produces empty CSV (sim runs but emits nothing
+# usable). DP/EMT pair with MNA (Modified Nodal Analysis, the default).
+# DAE is available for select component subsets.
+SOLVER_MAP = {
+    "MNA": dpsimpy.Solver.MNA,
+    "NRP": dpsimpy.Solver.NRP,
+    "DAE": dpsimpy.Solver.DAE,
+}
+
+# Default solver per domain when payload doesn't name one explicitly.
+DEFAULT_SOLVER_FOR_DOMAIN = {
+    dpsimpy.Domain.SP:  dpsimpy.Solver.NRP,
+    dpsimpy.Domain.DP:  dpsimpy.Solver.MNA,
+    dpsimpy.Domain.EMT: dpsimpy.Solver.MNA,
+}
+
 # Known CIM bundles, keyed by the file-service model_id (tail of the model
 # URL, with any extension stripped). Extend this dict to accept more models.
 # Single source of truth: ops/cim-bundles.json. Same JSON is consumed by
@@ -435,10 +452,21 @@ class _ProgressWatcher:
 # ---------------------------------------------------------------------------
 def build_cim_topology(sim_name: str, files: list[str], domain: Any, freq: float = 60):
     reader = dpsimpy.CIMReader(sim_name)
+    # GeneratorType depends on the solver/domain:
+    #   - SP + NRP  → PVNode  (Newton-Raphson formulation: gen bus is a PV node)
+    #   - DP / EMT  → IdealVoltageSource (time-stepped MNA stamps gen as voltage source)
+    # Passing IdealVoltageSource into SP yields an SP topology that contains
+    # DP-domain components and fails silently (empty CSV). See worker two-stage
+    # code path that relied on this being correct.
+    gen_type = (
+        dpsimpy.GeneratorType.PVNode
+        if domain == dpsimpy.Domain.SP
+        else dpsimpy.GeneratorType.IdealVoltageSource
+    )
     return reader.loadCIM(
         freq, list(files), domain,
         dpsimpy.PhaseType.Single,
-        dpsimpy.GeneratorType.IdealVoltageSource,
+        gen_type,
     )
 
 
@@ -934,11 +962,28 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
         for name, comp in logged_intfs.items():
             logger_cim.log_attribute(name, "i_intf", comp)
 
+    # Two-stage solver attempt (SP-presolve → init_with_powerflow → DP) was
+    # tried in session 32 but produced worse DP results because SP's PVNode
+    # path under this CIM produces non-physical internal node voltages that
+    # then seed DP with bad initial conditions. Remove until the SP path's
+    # numerical accuracy is addressed separately (docs/08 §6.12 todo).
+
     sim = dpsimpy.Simulation(sim_name, dpsimpy.LogLevel.info)
     sim.set_system(sys)
     sim.set_time_step(timestep)
     sim.set_final_time(finaltime)
     sim.set_domain(actual_domain)
+    # Pick solver: explicit from payload, otherwise default for domain.
+    solver_name = params.get("solver", "MNA")
+    solver = SOLVER_MAP.get(solver_name)
+    if solver is None:
+        solver = DEFAULT_SOLVER_FOR_DOMAIN.get(actual_domain, dpsimpy.Solver.MNA)
+        warnings.append(f"unknown solver '{solver_name}'; using default for {actual_domain.name}")
+    # SP must pair with NRP — force it if payload mismatched.
+    if actual_domain == dpsimpy.Domain.SP and solver != dpsimpy.Solver.NRP:
+        warnings.append(f"SP requires NRP solver (requested {solver_name}); forcing NRP")
+        solver = dpsimpy.Solver.NRP
+    sim.set_solver(solver)
     sim.add_logger(logger_cim)
 
     # H12: publish approximate progress while sim.run() blocks. Watcher reads
