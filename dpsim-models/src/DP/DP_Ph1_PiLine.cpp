@@ -38,43 +38,14 @@ void DP::Ph1::PiLine::initializeFromNodesAndTerminals(Real frequency) {
   mVirtualNodes[0]->setInitialVoltage(initialSingleVoltage(0) +
                                       (**mIntfCurrent)(0, 0) * **mSeriesRes);
 
-  // Active-source branch (R < 0): replace the R+L series with a Norton-
-  // equivalent constant current source calibrated at the steady-state
-  // operating point. This keeps the PF admittance implicit at the initial
-  // condition (matches pp.runpp) but removes the R*I coupling with the
-  // inductor that would otherwise amplify current in DP time-integration
-  // (trapezoidal rule is unstable when |R| > L/dt for R<0).
-  //
-  // Users can still inspect the intended series impedance via mSeriesRes /
-  // mSeriesInd; only the MNA stamping path uses the current source.
-  if (**mSeriesRes < 0) {
-    SPDLOG_LOGGER_INFO(mSLog,
-                       "Active-source line: R={} Ohm < 0, replacing R+L series "
-                       "with Norton-equivalent current source (I={} A) for "
-                       "DP stability. Steady-state matches PF solution.",
-                       (float)**mSeriesRes,
-                       Logger::phasorToString((**mIntfCurrent)(0, 0)));
-    mSubSeriesCurrentSource = std::make_shared<DP::Ph1::CurrentSource>(
-        **mName + "_active_src", mLogLevel);
-    // Current source convention: positive I flows from first connected node
-    // to second. We want current from terminal 0 to terminal 1 matching
-    // intfCurrent (which is defined I = (V1-V0)/Z; i.e. positive when V1>V0
-    // and Z>0). So pass intfCurrent as-is, connected terminal[0] → terminal[1].
-    mSubSeriesCurrentSource->setParameters((**mIntfCurrent)(0, 0));
-    mSubSeriesCurrentSource->connect(
-        {mTerminals[0]->node(), mTerminals[1]->node()});
-    mSubSeriesCurrentSource->initialize(mFrequencies);
-    mSubSeriesCurrentSource->initializeFromNodesAndTerminals(frequency);
-    addMNASubComponent(mSubSeriesCurrentSource,
-                       MNA_SUBCOMP_TASK_ORDER::TASK_BEFORE_PARENT,
-                       MNA_SUBCOMP_TASK_ORDER::TASK_BEFORE_PARENT, true);
-    // Skip the resistor + inductor/capacitor stamps below; the current
-    // source provides the entire series-branch contribution.
-    // (The parallel R/C shunts still apply.)
-    goto emit_parallel;
-  }
+  // Negative R or admittance is a legitimate outcome of Kron reduction —
+  // when internal nodes are eliminated, the reduced Y-matrix can have
+  // negative real parts. We stamp them directly as normal Resistor /
+  // Inductor; MNA handles negative conductance mathematically. Only the
+  // exact R == 0 case needs the Transformer remap (converter-side, see
+  // docs/08 §3) to avoid a singular MNA matrix.
 
-  // Create series sub components (standard passive path)
+  // Create series sub components (standard path — accepts R<0 and L<0)
   mSubSeriesResistor =
       std::make_shared<DP::Ph1::Resistor>(**mName + "_res", mLogLevel);
   mSubSeriesResistor->setParameters(**mSeriesRes);
@@ -115,7 +86,6 @@ void DP::Ph1::PiLine::initializeFromNodesAndTerminals(Real frequency) {
                        (float)**mSeriesInd, (float)seriesCap);
   }
 
-emit_parallel:
   // By default there is always a small conductance to ground to
   // avoid problems with floating nodes.
   Real defaultParallelCond = 1e-6;
@@ -231,15 +201,12 @@ void DP::Ph1::PiLine::mnaCompUpdateVoltage(const Matrix &leftVector) {
 
 void DP::Ph1::PiLine::mnaCompUpdateCurrent(const Matrix &leftVector) {
   // Read the current from whichever series subcomponent is active:
-  // - Inductor (standard passive line)
-  // - Capacitor (series compensation, mSeriesInd < 0)
-  // - CurrentSource (active-source line, mSeriesRes < 0)
+  // - Inductor (standard passive line, L>=0; negative R allowed)
+  // - Capacitor (series compensation, L<0)
   if (mSubSeriesInductor)
     (**mIntfCurrent)(0, 0) = mSubSeriesInductor->intfCurrent()(0, 0);
   else if (mSubSeriesCapacitor)
     (**mIntfCurrent)(0, 0) = mSubSeriesCapacitor->intfCurrent()(0, 0);
-  else if (mSubSeriesCurrentSource)
-    (**mIntfCurrent)(0, 0) = mSubSeriesCurrentSource->intfCurrent()(0, 0);
 }
 
 // #### Tear Methods ####

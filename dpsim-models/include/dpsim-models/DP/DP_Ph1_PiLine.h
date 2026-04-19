@@ -8,7 +8,6 @@
 #include <dpsim-models/Base/Base_Ph1_PiLine.h>
 #include <dpsim-models/CompositePowerComp.h>
 #include <dpsim-models/DP/DP_Ph1_Capacitor.h>
-#include <dpsim-models/DP/DP_Ph1_CurrentSource.h>
 #include <dpsim-models/DP/DP_Ph1_Inductor.h>
 #include <dpsim-models/DP/DP_Ph1_Resistor.h>
 #include <dpsim-models/Solver/MNATearInterface.h>
@@ -30,13 +29,10 @@ protected:
   /// Series Capacitor submodel (used when mSeriesInd < 0 — series
   /// compensation. C = -1 / (omega^2 * mSeriesInd))
   std::shared_ptr<Capacitor> mSubSeriesCapacitor;
-  /// Series Resistor submodel
+  /// Series Resistor submodel. Accepts negative R (legitimate after
+  /// Kron reduction of internal nodes); stamps as negative conductance
+  /// in the Y-bus matrix directly.
   std::shared_ptr<Resistor> mSubSeriesResistor;
-  /// Norton equivalent current source — used when mSeriesRes < 0
-  /// (active-source line, e.g. DER / inverter equivalent). The series
-  /// R + L branch is replaced by a constant current source calibrated at
-  /// the steady-state operating point so DP time-integration stays stable.
-  std::shared_ptr<CurrentSource> mSubSeriesCurrentSource;
   /// Parallel Resistor submodel at Terminal 0
   std::shared_ptr<Resistor> mSubParallelResistor0;
   // Parallel Capacitor submodel at Terminal 0
