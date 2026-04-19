@@ -7,7 +7,6 @@
  *********************************************************************************/
 
 #include "dpsim-models/MathUtils.h"
-#include <Eigen/src/Core/Array.h>
 #include <dpsim-models/Signal/DecouplingLineEMT_Ph3.h>
 
 using namespace CPS;

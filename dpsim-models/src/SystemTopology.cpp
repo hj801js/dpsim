@@ -102,10 +102,24 @@ void SystemTopology::initWithPowerflow(const SystemTopology &systemPF,
             compPF)) {
       if (domain == CPS::Domain::DP || domain == CPS::Domain::SP) {
         auto comp = this->component<SimPowerComp<Complex>>(compPF->name());
+        if (!comp) {
+          throw std::runtime_error(
+              "initWithPowerflow: no component named '" + compPF->name() +
+              "' in target system. Component names must match between the "
+              "powerflow system and the dynamic system; rename the dynamic "
+              "counterpart accordingly.");
+        }
         auto terminal = comp->terminals()[0];
         terminal->setPower(-genPF->getApparentPower());
       } else if (domain == CPS::Domain::EMT) {
         auto comp = this->component<SimPowerComp<Real>>(compPF->name());
+        if (!comp) {
+          throw std::runtime_error(
+              "initWithPowerflow: no component named '" + compPF->name() +
+              "' in target system. Component names must match between the "
+              "powerflow system and the dynamic system; rename the dynamic "
+              "counterpart accordingly.");
+        }
         auto terminal = comp->terminals()[0];
         terminal->setPower(-genPF->getApparentPower());
       }
