@@ -508,6 +508,53 @@ def _find_cim_bundle(payload: dict[str, Any]) -> tuple[str | None, list[str]]:
     return None, []
 
 
+def _collapse_load_series(
+    series: list[dict[str, Any]],
+    sim_type: str,
+    finaltime_sec: float,
+) -> float | None:
+    """P3.3 time-series MVP — reduce a (t_sec, factor) series to a scalar.
+
+    Rules:
+      * Powerflow is steady-state; the worst-case/conservative pick is max.
+        Users running a Powerflow "profile" are almost always looking for
+        peak-load stress response, so we emit that.
+      * DP / EMT are time-stepped but dpsim's Python API doesn't expose a
+        PreStep hook we can cleanly use to rescale per step. As a
+        pragmatic stand-in we linearly interpolate the series value at
+        finaltime_sec and apply that — i.e. the sim runs as if the load
+        ramp had settled to its end-of-horizon point.
+    """
+    if not series:
+        return None
+    clean: list[tuple[float, float]] = []
+    for pt in series:
+        try:
+            t = float(pt.get("t_sec", 0))
+            f = float(pt.get("factor", 1.0))
+        except (TypeError, ValueError):
+            continue
+        clean.append((t, f))
+    if not clean:
+        return None
+    if sim_type.lower() == "powerflow":
+        return max(f for _, f in clean)
+    # Time-stepped: interpolate at finaltime.
+    clean.sort(key=lambda p: p[0])
+    if finaltime_sec <= clean[0][0]:
+        return clean[0][1]
+    if finaltime_sec >= clean[-1][0]:
+        return clean[-1][1]
+    for i in range(1, len(clean)):
+        t0, f0 = clean[i - 1]
+        t1, f1 = clean[i]
+        if t0 <= finaltime_sec <= t1:
+            if t1 == t0:
+                return f0
+            return f0 + (f1 - f0) * (finaltime_sec - t0) / (t1 - t0)
+    return clean[-1][1]
+
+
 def _apply_load_factor(files: list[str], factor: float, sim_id: str) -> tuple[list[str], str]:
     """P3.3 — scale every load's SvPowerFlow p/q by `factor`. Mutation at the
     CIM SV level so CIMReader sees pre-scaled values; downstream dpsim
@@ -788,7 +835,24 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             warnings.append(f"outage mutation skipped (io error); running baseline")
     # P3.3 — scalar load factor. Stacks with outage by reusing the cim-outage dir.
+    # Optional time-series load_factor_series ([{t_sec, factor}, ...]) is
+    # collapsed to an effective scalar here: max for steady-state Powerflow
+    # (stress-test intent), end-of-run interpolated value for DP/EMT. True
+    # per-step time-stepping isn't exposed by dpsim's Python API.
     load_factor = params.get("load_factor")
+    series = params.get("load_factor_series")
+    if series:
+        sim_type_for_series = str(params.get("simulation_type", ""))
+        effective = _collapse_load_series(series, sim_type_for_series, finaltime)
+        if effective is not None:
+            if load_factor is not None and float(load_factor) != 1.0:
+                # Combine: multiply. User-set scalar × series-derived factor.
+                effective = effective * float(load_factor)
+            load_factor = effective
+            warnings.append(
+                f"load profile ({len(series)} points) collapsed to effective "
+                f"×{effective:g} for {sim_type_for_series.lower()}"
+            )
     load_factor_status = None
     if cim_files and load_factor is not None and float(load_factor) != 1.0:
         cim_files, load_factor_status = _apply_load_factor(cim_files, float(load_factor), str(sim_id))

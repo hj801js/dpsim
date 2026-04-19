@@ -113,6 +113,35 @@ class TestFindCimBundle:
         assert token == "abc123"
         assert sorted(Path(f).name for f in files) == ["EQ.xml", "TP.xml"]
 
+    def test_collapse_load_series_powerflow_uses_max(self):
+        """Powerflow → max(factor) to drive a stress-test peak-load sim."""
+        series = [
+            {"t_sec": 0.0, "factor": 1.0},
+            {"t_sec": 5.0, "factor": 1.8},
+            {"t_sec": 10.0, "factor": 1.2},
+        ]
+        assert worker._collapse_load_series(series, "Powerflow", 10.0) == 1.8
+
+    def test_collapse_load_series_dp_interpolates_at_finaltime(self):
+        """DP/EMT → linear interpolation at finaltime_sec."""
+        series = [
+            {"t_sec": 0.0,  "factor": 1.0},
+            {"t_sec": 10.0, "factor": 2.0},
+        ]
+        # finaltime = 5.0s → halfway → 1.5
+        assert worker._collapse_load_series(series, "DP", 5.0) == 1.5
+        # Beyond horizon → clamp to last point
+        assert worker._collapse_load_series(series, "DP", 99.0) == 2.0
+        # Before first point → clamp to first
+        assert worker._collapse_load_series(series, "DP", -1.0) == 1.0
+
+    def test_collapse_load_series_empty_returns_none(self):
+        assert worker._collapse_load_series([], "DP", 1.0) is None
+        # Malformed entries are skipped silently; all-malformed → None.
+        assert worker._collapse_load_series(
+            [{"t_sec": "oops"}], "DP", 1.0,
+        ) is None
+
     def test_malicious_zip_slip_rejected(self, monkeypatch, tmp_path):
         """A ZIP with an entry that resolves outside the cache dir must not
         be extracted. Regression for the ZIP-slip finding in docs/43 #1."""
