@@ -1,0 +1,61 @@
+{
+  "_doc": "cigre_mv DP 1ms/500ms bus voltage magnitudes (volts). Auto-captured.",
+  "simulation": {
+    "domain": "DP",
+    "timestep_ms": 1,
+    "finaltime_ms": 500,
+    "model": "cigre_mv"
+  },
+  "tolerance_t0_pct": 1.0,
+  "tolerance_tlast_pct": 2.0,
+  "buses": {
+    "v_n0": {
+      "t0": 110000.0,
+      "tlast": 110000.0
+    },
+    "v_n1": {
+      "t0": 18621.55,
+      "tlast": 18621.93
+    },
+    "v_n10": {
+      "t0": 18461.1,
+      "tlast": 18461.47
+    },
+    "v_n11": {
+      "t0": 19367.15,
+      "tlast": 19369.8
+    },
+    "v_n2": {
+      "t0": 19844.79,
+      "tlast": 19840.34
+    },
+    "v_n3": {
+      "t0": 18510.02,
+      "tlast": 18510.35
+    },
+    "v_n4": {
+      "t0": 18490.28,
+      "tlast": 18490.6
+    },
+    "v_n5": {
+      "t0": 18465.08,
+      "tlast": 18465.44
+    },
+    "v_n6": {
+      "t0": 18584.21,
+      "tlast": 18584.36
+    },
+    "v_n7": {
+      "t0": 18558.61,
+      "tlast": 18558.59
+    },
+    "v_n8": {
+      "t0": 18528.34,
+      "tlast": 18528.12
+    },
+    "v_n9": {
+      "t0": 18504.38,
+      "tlast": 18504.62
+    }
+  }
+}
