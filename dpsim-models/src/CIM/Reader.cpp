@@ -528,8 +528,22 @@ Reader::mapPowerTransformer(CIMPP::PowerTransformer *trans) {
     }
   }
 
-  // TODO: To be extracted from cim class
-  Real ratioPhase = 0;
+  // Transformer phase shift (ratioPhase) derived from CIM.
+  // CIM16 encodes phase displacement per winding as `phaseAngleClock`: an
+  // integer 0..11 where each step = 30°. For a Dyn11 transformer (wye-neutral
+  // primary, delta secondary with 11-o'clock displacement), end2 carries
+  // clock=11 → -30° shift relative to end1. The relative phase shift between
+  // the two ends is what dpsim's transformer models consume as `ratioPhase`.
+  Real phaseClockEnd1 = 0.0, phaseClockEnd2 = 0.0;
+  try { phaseClockEnd1 = (Real)end1->phaseAngleClock; } catch (ReadingUninitializedField *) {}
+  try { phaseClockEnd2 = (Real)end2->phaseAngleClock; } catch (ReadingUninitializedField *) {}
+  Real ratioPhase = (phaseClockEnd2 - phaseClockEnd1) * 30.0 * M_PI / 180.0;
+  if (ratioPhase != 0.0) {
+    SPDLOG_LOGGER_INFO(mSLog,
+                       "    ratioPhase={} rad (clockEnd1={}, clockEnd2={})",
+                       (float)ratioPhase, (float)phaseClockEnd1,
+                       (float)phaseClockEnd2);
+  }
 
   // Calculate resistance and inductance referred to higher voltage side
   Real resistance = 0;
