@@ -1,0 +1,17 @@
+{
+  "_doc": "WSCC-9 DP 1ms/500ms bus voltage magnitudes (volts). Matched against Anderson reference + CIM SV + MATPOWER (docs/20). Tolerance: 0.5% at t=0 (steady-state start), 1% at t=last (small numerical drift OK at 1ms step).",
+  "simulation": {"domain": "DP", "timestep_ms": 1, "finaltime_ms": 500, "model": "wscc9"},
+  "tolerance_t0_pct": 0.5,
+  "tolerance_tlast_pct": 1.0,
+  "buses": {
+    "v_n0": {"t0": 14145.0,   "tlast": 14145.0},
+    "v_n1": {"t0": 228995.1,  "tlast": 227501.01},
+    "v_n2": {"t0": 232910.49, "tlast": 231305.36},
+    "v_n3": {"t0": 235931.33, "tlast": 234884.36},
+    "v_n4": {"t0": 17160.0,   "tlast": 17160.0},
+    "v_n5": {"t0": 18450.0,   "tlast": 18450.0},
+    "v_n6": {"t0": 235926.96, "tlast": 234921.58},
+    "v_n7": {"t0": 237441.18, "tlast": 236413.2},
+    "v_n8": {"t0": 233652.99, "tlast": 232363.51}
+  }
+}
