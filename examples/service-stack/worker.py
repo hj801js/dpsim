@@ -124,20 +124,32 @@ DOMAIN_MAP = {
 
 # Known CIM bundles, keyed by the file-service model_id (tail of the model
 # URL, with any extension stripped). Extend this dict to accept more models.
-CIM_BUNDLES = {
-    "wscc9":    sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/WSCC-09/WSCC-09/*.xml"))),
-    "ieee14":   sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/IEEE-14/*.xml"))),
-    "ieee39":   sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/IEEE-39/*.xml"))),
-    "cigre_mv": sorted(glob.glob(str(
-        DPSIM_BUILD / "_deps/cim-data-src/CIGRE_MV/NEPLAN/"
-                      "CIGRE_MV_no_tapchanger_noLoad1_LeftFeeder_With_LoadFlow_Results/*.xml"
-    ))),
-    # Matpower single-file cases. Each XML bundles EQ+TP in one, which is
-    # exactly what CIMReader prefers when there's no multi-file profile.
-    "matpower_case9":   sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/Matpower_cases/case9.xml"))),
-    "matpower_case14":  sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/Matpower_cases/case14.xml"))),
-    "matpower_case300": sorted(glob.glob(str(DPSIM_BUILD / "_deps/cim-data-src/Matpower_cases/case300.xml"))),
-}
+# Single source of truth: ops/cim-bundles.json. Same JSON is consumed by
+# dpsim-api's /topology handler and ops/gen-model-catalog.py, so adding
+# a new bundle only needs one edit.
+def _load_cim_bundles() -> dict[str, list[str]]:
+    # Manifest lives at the repo root; compute relative to this file.
+    manifest_path = Path(__file__).resolve().parents[3] / "ops" / "cim-bundles.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except Exception as exc:
+        logger.warning("cim-bundles manifest unreadable (%s): %s", manifest_path, exc)
+        return {}
+    cim_root = DPSIM_BUILD / "_deps" / "cim-data-src"
+    out: dict[str, list[str]] = {}
+    for entry in manifest.get("bundles", []):
+        mid = entry.get("id")
+        if not mid:
+            continue
+        p = cim_root / entry.get("path", "")
+        if entry.get("kind") == "file":
+            out[mid] = [str(p)] if p.exists() else []
+        else:
+            out[mid] = sorted(glob.glob(str(p / "*.xml")))
+    return out
+
+
+CIM_BUNDLES = _load_cim_bundles()
 
 MAX_FINAL_TIME_SEC = 30.0
 MIN_TIMESTEP_SEC = 1e-5
