@@ -106,6 +106,11 @@ private:
   std::map<String, TopologicalTerminal::Ptr> mPowerflowTerminals;
   ///
   Bool mUseProtectionSwitches = false;
+  /// When true, emit DP::Ph1::PQLoadCS (constant-PQ, current source that
+  /// tracks terminal voltage each step) instead of DP::Ph1::RXLoad
+  /// (constant-impedance). PQ matches pandapower.runpp mathematics; RXLoad
+  /// is only correct near the init operating point. See docs/upstream-prs/04.
+  Bool mUsePQLoad = false;
 
   // #### shunt component settings ####
   /// activates global shunt capacitor setting
@@ -203,6 +208,9 @@ public:
   void setShuntConductance(Real v);
   /// If set, some components like loads include protection switches
   void useProtectionSwitches(Bool value = true);
+  /// Switch DP loads from constant-impedance (RXLoad, default) to
+  /// constant-PQ (PQLoadCS). Matches pandapower.runpp semantics.
+  void usePQLoad(Bool value = true);
 };
 } // namespace CIM
 } // namespace CPS

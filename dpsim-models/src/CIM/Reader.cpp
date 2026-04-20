@@ -59,6 +59,8 @@ void Reader::useProtectionSwitches(Bool value) {
   mUseProtectionSwitches = value;
 }
 
+void Reader::usePQLoad(Bool value) { mUsePQLoad = value; }
+
 Real Reader::unitValue(Real value, CIMPP::UnitMultiplier mult) {
   switch (mult) {
   case UnitMultiplier::p:
@@ -358,6 +360,9 @@ Reader::mapEnergyConsumer(CIMPP::EnergyConsumer *consumer) {
     if (mUseProtectionSwitches)
       return std::make_shared<DP::Ph1::RXLoadSwitch>(consumerRid, consumerName,
                                                      mComponentLogLevel);
+    else if (mUsePQLoad)
+      return std::make_shared<DP::Ph1::PQLoadCS>(consumerRid, consumerName,
+                                                  mComponentLogLevel);
     else
       return std::make_shared<DP::Ph1::RXLoad>(consumerRid, consumerName,
                                                mComponentLogLevel);

@@ -90,17 +90,35 @@ void DP::Ph1::PQLoadCS::initializeFromNodesAndTerminals(Real frequency) {
 }
 
 void DP::Ph1::PQLoadCS::updateSetPoint() {
-  // Calculate new current set point.
+  // Constant-PQ semantics: recompute current from the latest measured
+  // terminal voltage so `power = V * conj(I)` stays constant across
+  // network drift. Fall back to nominal only at t=0 before the first
+  // MNA solve has populated mIntfVoltage.
+  //
+  // This is the difference between the old behavior (current pinned to
+  // a flat current source) and a true PQ load: the old path diverged
+  // from pandapower.runpp by several percent on cases where the
+  // operating point drifts from 1.0 pu (case1354pegase, case118 in
+  // transient scenarios). Using the latest voltage collapses that
+  // drift because the load's S = V * conj(I) stays = S_set by
+  // construction.
   Complex power = {**mActivePower, **mReactivePower};
-  Complex current = power / **mNomVoltage;
-  //Complex current = power / (**mIntfVoltage)(0,0);
+  Complex voltage = (**mIntfVoltage)(0, 0);
+  if (std::abs(voltage) < 1e-9) {
+    // First step / uninitialised — fall back to nominal so the
+    // current source has a well-defined set point.
+    voltage = Complex(**mNomVoltage, 0);
+  }
+  Complex current = power / voltage;
 
   **mSubCurrentSource->mCurrentRef = std::conj(current);
   SPDLOG_LOGGER_DEBUG(mSLog,
                       "\n--- update set points ---"
                       "\npower: {:s}"
+                      "\nVoltage: {:s}"
                       "\nCurrent: {:s}",
                       Logger::phasorToString(power),
+                      Logger::phasorToString(voltage),
                       Logger::phasorToString(std::conj(current)));
 }
 
