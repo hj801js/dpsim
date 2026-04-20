@@ -312,12 +312,32 @@ void PFSolverPowerPolar::updateSolution() {
   UInt npqpv = mNumPQBuses + mNumPVBuses;
   UInt k;
 
+  // Damped Newton update: limit |Δθ| and |ΔV/V| per iteration so large flat-
+  // start residuals on ill-conditioned systems (Kron-reduced MATPOWER cases
+  // with neg-R, wide-voltage backbone) can't send the solver to a wrong
+  // basin. pandapower applies similar step control via its Q-limit loop; we
+  // apply it unconditionally because dpsim's PF has no Q-limit backoff.
   for (UInt a = 0; a < npqpv; ++a) {
     k = mPQPVBusIndices[a];
-    sol_D(k) += mX.coeff(a);
 
-    if (a < mNumPQBuses)
-      sol_V(k) = sol_V.coeff(k) * (1.0 + mX.coeff(a + npqpv));
+    Real dTheta = mX.coeff(a);
+    if (dTheta > mMaxAngleStep)
+      dTheta = mMaxAngleStep;
+    else if (dTheta < -mMaxAngleStep)
+      dTheta = -mMaxAngleStep;
+    sol_D(k) += dTheta;
+
+    if (a < mNumPQBuses) {
+      Real dVratio = mX.coeff(a + npqpv);
+      if (dVratio > mMaxVoltageStep)
+        dVratio = mMaxVoltageStep;
+      else if (dVratio < -mMaxVoltageStep)
+        dVratio = -mMaxVoltageStep;
+      Real vNew = sol_V.coeff(k) * (1.0 + dVratio);
+      if (vNew < mVmin) vNew = mVmin;
+      else if (vNew > mVmax) vNew = mVmax;
+      sol_V(k) = vNew;
+    }
   }
 
   //Correct for PV buses

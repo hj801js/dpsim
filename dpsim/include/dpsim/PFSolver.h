@@ -80,9 +80,16 @@ protected:
   /// Solver tolerance
   Real mTolerance = 1e-8;
   /// Maximum number of iterations
-  CPS::UInt mMaxIterations = 9;
+  CPS::UInt mMaxIterations = 30;
   /// Actual number of iterations
   CPS::UInt mIterations;
+  /// Max per-iteration voltage-ratio step (|ΔV/V|). pandapower-style damping.
+  Real mMaxVoltageStep = 0.2;
+  /// Max per-iteration angle step in radians (π/6).
+  Real mMaxAngleStep = 0.5235987755982988;
+  /// Voltage magnitude clamp applied after each update.
+  Real mVmin = 0.5;
+  Real mVmax = 2.0;
   /// Base power of per-unit system
   CPS::Real mBaseApparentPower;
   /// Convergence flag
