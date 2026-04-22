@@ -377,6 +377,17 @@ def get_status(sim_id: str | int) -> dict[str, Any] | None:
     return json.loads(raw) if raw else None
 
 
+def is_canceled(sim_id: str | int) -> bool:
+    """True when dpsim-api has marked this simulation as canceled
+    (POST /simulation/<id>/cancel → `sim:<id>:canceled` redis flag).
+    Best-effort: redis hiccup returns False so the job runs rather than
+    appearing mysteriously canceled."""
+    try:
+        return bool(_redis.exists(f"sim:{sim_id}:canceled"))
+    except Exception:
+        return False
+
+
 def set_bus_map(sim_id: str | int, names: list[str]) -> None:
     """Write the solver-determined bus-name ordering for this sim under
     a separate sidechannel key. The UI joins worker CSV columns
@@ -845,6 +856,73 @@ def clamp_params(p: dict[str, Any]) -> tuple[float, float, list[str]]:
     return ts, ft, warnings
 
 
+def _run_pandapower_engine(payload: dict[str, Any], cim_files: list[str],
+                            job_dir: Path, sim_id, warnings: list[str]) -> dict[str, Any]:
+    """Phase 2: pandapower engine path.
+
+    Parse the same CIM files the dpsim path would have used, run pp.runpp()
+    and emit a CSV that mirrors dpsim's time-domain schema (time, v_nK.re,
+    v_nK.im …) so the rest of the pipeline (upload, result panel) can stay
+    oblivious to which engine produced the bytes.
+
+    pp gives one steady-state point; we replicate it across two timesteps
+    (t=0 and t=finaltime) so downstream CSV parsers can load it as a valid
+    two-row time series.
+    """
+    import math
+    import pandapower as pp
+    # Add backend/src to sys.path so pisa.adapters is importable.
+    _backend_src = Path("/Users/hk/DPsim_hk/backend/src")
+    if str(_backend_src) not in sys.path:
+        sys.path.insert(0, str(_backend_src))
+    from pisa.adapters.cim_to_pandapower import CIMToPandapowerConverter
+
+    params = payload["parameters"]
+    finaltime_s = max(0.001, float(params.get("finaltime", 500)) / 1000.0)
+
+    # Concat all CIM XML files into one buffer (ZIP-style merge).
+    bufs: list[bytes] = []
+    for p in cim_files:
+        bufs.append(Path(p).read_bytes())
+    if len(cim_files) == 1:
+        cim_bytes = bufs[0]
+    else:
+        import zipfile, io
+        z = io.BytesIO()
+        with zipfile.ZipFile(z, "w") as zf:
+            for p, body in zip(cim_files, bufs):
+                zf.writestr(Path(p).name, body)
+        cim_bytes = z.getvalue()
+
+    conv = CIMToPandapowerConverter()
+    net = conv.convert(cim_bytes)
+    warnings.extend(f"pp-converter: [{w.kind}] {w.detail}" for w in conv.warnings[:5])
+    pp.runpp(net, calculate_voltage_angles=True)
+
+    # Write CSV matching dpsim's schema.
+    csv_path = job_dir / f"job_{sim_id}.csv"
+    bus_names: list[str] = []
+    with csv_path.open("w") as f:
+        header = ["time"]
+        for b in net.bus.index:
+            header += [f"v_n{b}.im", f"v_n{b}.re"]
+            bus_names.append(str(net.bus.at[b, "name"]))
+        f.write(",".join(header) + "\n")
+        for t_s in (0.0, finaltime_s):
+            row = [f"{t_s:.9e}"]
+            for b in net.bus.index:
+                vm = float(net.res_bus.at[b, "vm_pu"]) * float(net.bus.at[b, "vn_kv"]) * 1000.0
+                va_rad = math.radians(float(net.res_bus.at[b, "va_degree"]))
+                row += [f"{vm * math.sin(va_rad):.6f}", f"{vm * math.cos(va_rad):.6f}"]
+            f.write(",".join(row) + "\n")
+    set_bus_map(sim_id, bus_names)
+    return {
+        "csv_path": str(csv_path),
+        "source": "pp:runpp",
+        "vm_pu_range": [float(net.res_bus.vm_pu.min()), float(net.res_bus.vm_pu.max())],
+    }
+
+
 def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
     params = payload["parameters"]
     results_file = params.get("results_file", "anon")
@@ -857,6 +935,7 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
 
     dom_name = params.get("domain", "DP")
     domain = DOMAIN_MAP.get(dom_name, dpsimpy.Domain.DP)
+    engine = params.get("engine", "dpsim").lower()
     warnings: list[str] = []
     # EMT resolution (P3.1): EMT runs fine on programmatic topologies but
     # segfaults inside CIMpp. Decide the actual domain only after we know
@@ -927,6 +1006,45 @@ def run_simulation(payload: dict[str, Any]) -> dict[str, Any]:
             warnings.append(f"load factor skipped: no LOAD* SvPowerFlow entries in CIM")
         else:
             warnings.append(f"load factor skipped (io error)")
+    # Phase 2 — engine=pandapower takes the CIM and solves via pp.runpp()
+    # instead of dpsim. CSV schema is shared so the pipeline downstream
+    # treats the result identically. engine=both runs BOTH: pp first
+    # (cheap) to produce sim.<id>.pp.csv, then dpsim as normal.
+    if engine in ("pandapower", "pp", "both"):
+        if not cim_files:
+            warnings.append(f"engine={engine} requested without CIM; falling back to dpsim")
+        else:
+            try:
+                pp_result = _run_pandapower_engine(payload, cim_files, job_dir, sim_id, warnings)
+                if engine in ("pandapower", "pp"):
+                    # pp-only: treat pp CSV as the primary result and return
+                    # early. Skip dpsim build entirely.
+                    set_progress(sim_id, 1.0)
+                    return {
+                        "status": "succeeded",
+                        "source": f"pp:{token}" if cim_files else "pp:demo",
+                        "results_file": results_file,
+                        "warnings": warnings,
+                        "engine": "pandapower",
+                        "vm_pu_range": pp_result["vm_pu_range"],
+                    }
+                # engine=both: keep the pp output alongside dpsim's
+                warnings.append(
+                    f"dual-engine: pp.runpp() vm_pu {pp_result['vm_pu_range'][0]:.4f}"
+                    f"..{pp_result['vm_pu_range'][1]:.4f} (saved to job_{sim_id}.csv.pp)"
+                )
+                # Rename pp CSV so dpsim's CSV doesn't overwrite it
+                pp_csv = Path(pp_result["csv_path"])
+                pp_csv.rename(pp_csv.with_suffix(pp_csv.suffix + ".pp"))
+            except Exception as e:
+                warnings.append(
+                    f"pp engine failed ({type(e).__name__}: {str(e)[:100]}); "
+                    f"continuing with dpsim" if engine == "both"
+                    else f"pp engine failed ({type(e).__name__})"
+                )
+                if engine in ("pandapower", "pp"):
+                    raise  # pp-only: fail the whole job
+
     if cim_files:
         # P3.1 — CIMReader + EMT segfaults inside dpsim/CIMpp (probed session 22).
         # Fall back to DP on the CIM path only; keep EMT available for demo.
@@ -1150,6 +1268,19 @@ def on_msg(ch, method, props, body: bytes) -> None:
         ctx_token = _otel_context.attach(_otel_set_span_in_context(root_span))
     try:
       try:
+        # v1.1.3 cancel short-circuit: dpsim-api may have marked this sim
+        # canceled while it sat in the queue. Skip the sim cleanly
+        # (ack + record canceled status) so no dpsim cycles are wasted
+        # and the SSE/status paths see the terminal state.
+        params = payload.get("parameters", {})
+        params_sim_id = params.get("simulation_id", params.get("results_file"))
+        if params_sim_id is not None and is_canceled(params_sim_id):
+            log("job canceled pre-run", sim_id=sim_id)
+            set_status(params_sim_id, "canceled")
+            JOBS_TOTAL.labels(outcome="canceled", domain=domain_label).inc()
+            root_span.set_attribute("dpsim.canceled_prerun", True)
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
         status = run_simulation(payload)
         log("job complete", sim_id=sim_id, upload=status["upload"], source=status["topology_source"])
         JOBS_TOTAL.labels(outcome="done", domain=domain_label).inc()
